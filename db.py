@@ -20,6 +20,30 @@ def today():
     return datetime.now(SGT).date()
 
 
+def to_sgt(text):
+    """Turn a timestamp from the database into a datetime in Singapore time."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(SGT)
+
+
+def short_date(text):
+    """'2026-11-09T08:12:03+00:00' or '2026-11-09' becomes '9th Nov'."""
+    try:
+        d = datetime.fromisoformat(text) if len(text) == 10 else to_sgt(text)
+    except ValueError:
+        return text[:10]
+    day = d.day
+    suffix = "th" if 11 <= day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix} {d.strftime('%b')}"
+
+
+def short_time(text):
+    """'2026-11-09T08:12:03+00:00' becomes '4:12 PM' (Singapore time)."""
+    try:
+        return to_sgt(text).strftime("%-I:%M %p")
+    except ValueError:
+        return ""
+
+
 def list_courses(sb):
     return sb.table("courses").select("*").order("created_at").execute().data
 
@@ -55,7 +79,7 @@ def save_notes(sb, doc_id, notes):
 def list_quizzes(sb, doc_id):
     return (
         sb.table("quizzes")
-        .select("id, created_at, model, questions")
+        .select("id, created_at, model, name, questions")
         .eq("document_id", doc_id)
         .order("created_at", desc=True)
         .execute()
@@ -63,8 +87,8 @@ def list_quizzes(sb, doc_id):
     )
 
 
-def save_quiz(sb, doc_id, model, questions):
-    row = {"document_id": doc_id, "model": model, "questions": questions}
+def save_quiz(sb, doc_id, model, questions, name):
+    row = {"document_id": doc_id, "model": model, "questions": questions, "name": name}
     return sb.table("quizzes").insert(row).execute().data[0]
 
 

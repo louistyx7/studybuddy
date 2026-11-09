@@ -1,6 +1,7 @@
 import config  # noqa: F401  (loads the keys before anything else needs them)
 import random
 from collections import Counter
+from pathlib import Path
 
 import anthropic
 import streamlit as st
@@ -17,7 +18,13 @@ from quiz_ui import render_quiz, start_quiz, clear_quiz
 MAX_MB = 10  # biggest file we accept
 PRICES = {MODEL_CHEAP: (0.10, 0.50), MODEL_STRONG: (2.00, 10.00)}  # per million tokens
 STYLE_LABELS = {"general": "General", "finance": "Finance", "physio": "Physiotherapy"}
+STYLE_BADGES = {"general": "blue", "finance": "violet", "physio": "green"}
+MODEL_CHOICES = {
+    "Standard (Cheapest)": MODEL_CHEAP,
+    "Stronger (About 20x the Price)": MODEL_STRONG,
+}
 REVISION_SIZE = 10  # questions per revision round
+MAX_NAME_LENGTH = 60  # longest quiz name we accept
 
 st.set_page_config(page_title="StudyBuddy", page_icon="📚")
 sb = require_login()  # the page stops here until someone is signed in
@@ -82,7 +89,88 @@ def make_notes(doc, model):
     )
 
 
-def make_quiz(course, doc, model, n_questions):
+def quiz_name(q, filename):
+    """A quiz's name. Quizzes made before names existed use the PDF's name."""
+    return q.get("name") or Path(filename).stem
+
+
+def quiz_labels_for(filename, saved):
+    """Names for the saved-quiz picker: 'Chapter 3 Practice · 9th Nov'.
+    If two quizzes share a name and day, the time is added so they can be told apart."""
+    base = {q["id"]: f"{quiz_name(q, filename)} · {db.short_date(q['created_at'])}" for q in saved}
+    counts = Counter(base.values())
+    labels = {}
+    for q in saved:
+        label = base[q["id"]]
+        if counts[label] > 1:
+            label += f" · {db.short_time(q['created_at'])}"
+        labels[q["id"]] = label
+    return labels
+
+
+def percent(score, total):
+    return round(100 * score / total) if total else 0
+
+
+def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
+    """The progress dashboard for one lecture. attempts is newest first."""
+    st.subheader("📊 Progress Dashboard")
+    if not attempts:
+        st.info("Finish a quiz and your scores, trend and weak topics will appear here.")
+        return
+
+    pcts = [percent(a["score"], a["total"]) for a in attempts]  # newest first
+    latest = pcts[0]
+    change = f"{latest - pcts[1]:+d}%" if len(pcts) > 1 else None
+    due_now = sum(1 for m in lecture_missed if m["due_on"] <= today_iso)
+
+    # Row 1: the headline numbers
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Latest Score", f"{latest}%", delta=change)
+        c2.metric("Average", f"{round(sum(pcts) / len(pcts))}%")
+        c3.metric("Best", f"{max(pcts)}%")
+        c4.metric("Due Today", due_now)
+        st.caption(f"Based on {len(pcts)} attempt(s) on this lecture.")
+
+    # Row 2: trend on the left, weak topics on the right
+    left, right = st.columns(2)
+    with left:
+        with st.container(border=True):
+            st.markdown("**📈 Score Trend**")
+            if len(pcts) > 1:
+                st.line_chart({"Score (%)": pcts[::-1]}, height=200)  # oldest to newest
+            else:
+                st.caption("Take another quiz to see your trend.")
+    with right:
+        with st.container(border=True):
+            st.markdown("**🎯 Topics to Revise**")
+            counts = Counter(m["topic"] for m in lecture_missed)
+            if counts:
+                top = counts.most_common(5)
+                biggest = top[0][1]
+                for topic, number in top:
+                    st.progress(number / biggest, text=f"{safe(topic)} · {number} to revise")
+                st.caption("Re-read your notes on these topics, then use Revise & Practise.")
+            else:
+                st.success("No weak topics. Nice work!")
+
+    # Row 3: a power bar for each recent attempt
+    with st.container(border=True):
+        st.markdown("**🕘 Recent Attempts**")
+        for a, pct in list(zip(attempts, pcts))[:5]:
+            dot = "🟢" if pct >= 70 else "🟡" if pct >= 50 else "🔴"
+            name = quiz_name(by_id[a["quiz_id"]], filename)
+            st.progress(
+                pct / 100,
+                text=f"{dot} {safe(name)} · {db.short_date(a['created_at'])} · "
+                     f"{a['score']} / {a['total']} ({pct}%)",
+            )
+        st.caption("🟢 70% and above · 🟡 50 to 69% · 🔴 Below 50%")
+
+
+def make_quiz(course, doc, model, n_questions, name):
+    name = (name or "").strip()[:MAX_NAME_LENGTH] or Path(doc["filename"]).stem
     with st.spinner("Asking Claude for a quiz..."):
         questions, tokens_in, tokens_out = generate_quiz(
             doc["lecture_text"],
@@ -90,10 +178,11 @@ def make_quiz(course, doc, model, n_questions):
             style_hint=STYLE_HINTS[course["style"]],
             model=model,
         )
-    row = db.save_quiz(sb, doc["id"], model, questions)
+    row = db.save_quiz(sb, doc["id"], model, questions, name)
     clear_quiz()
     st.session_state["quiz"] = questions
     st.session_state["quiz_id"] = row["id"]
+    st.session_state["quiz_title"] = name
     st.session_state["quiz_info"] = (
         f"{len(questions)} questions | {tokens_in} in | {tokens_out} out | "
         f"about ${cost_of(model, tokens_in, tokens_out):.4f}"
@@ -101,11 +190,12 @@ def make_quiz(course, doc, model, n_questions):
     start_quiz()
 
 
-def open_quiz(row):
-    """Runs when 'Open quiz' is clicked: load a saved quiz (free, no Claude)."""
+def open_quiz(row, name):
+    """Runs when 'Open Quiz' is clicked: load a saved quiz (free, no Claude)."""
     clear_quiz()
     st.session_state["quiz"] = row["questions"]
     st.session_state["quiz_id"] = row["id"]
+    st.session_state["quiz_title"] = name
     start_quiz()
 
 
@@ -125,7 +215,7 @@ def start_revision(candidates):
     clear_quiz()
     st.session_state["quiz"] = questions
     st.session_state["quiz_id"] = None  # a revision round is not a saved quiz
-    st.session_state["quiz_title"] = "🔁 Revision round"
+    st.session_state["quiz_title"] = "🔁 Revision Round"
     start_quiz()
 
 
@@ -140,12 +230,12 @@ def start_mixed(course_id):
     clear_quiz()
     st.session_state["quiz"] = questions
     st.session_state["quiz_id"] = None
-    st.session_state["quiz_title"] = "🔀 Mixed practice"
+    st.session_state["quiz_title"] = "🔀 Mixed Practice"
     start_quiz()
 
 
 def flag_question(course_id, q):
-    """Runs when 'This question looks wrong' is clicked. Returns True if it was saved."""
+    """Runs when 'Report This Question' is clicked. Returns True if it was saved."""
     try:
         db.flag_question(sb, course_id, q)
         st.toast("Thanks, reported. It won't come back in revision or mixed practice.")
@@ -171,10 +261,11 @@ courses = db.list_courses(sb)
 
 with st.sidebar:
     st.divider()
-    with st.expander("➕ New course", expanded=not courses):
-        new_name = st.text_input("Course name", key="new_course_name")
-        new_style = st.selectbox("Type", list(STYLE_LABELS), format_func=STYLE_LABELS.get, key="new_course_style")
-        if st.button("Create course"):
+    with st.expander("➕ New Course", expanded=not courses):
+        new_name = st.text_input("Course Name", key="new_course_name")
+        new_style = st.selectbox("Course Type", list(STYLE_LABELS), format_func=STYLE_LABELS.get,
+                                 key="new_course_style")
+        if st.button("Create Course"):
             if not new_name.strip():
                 st.error("Please type a course name.")
             elif run_safely(create_course, new_name, new_style):
@@ -191,7 +282,7 @@ if not courses:
 
 course = next(c for c in courses if c["id"] == st.session_state["course_id"])
 st.title(f"📚 {course['name']}")
-st.caption("Course type: " + STYLE_LABELS[course["style"]])
+st.markdown(f":{STYLE_BADGES[course['style']]}-badge[{STYLE_LABELS[course['style']]} Course]")
 
 # A different course than last time? Close any open quiz.
 if st.session_state.get("active_course") != course["id"]:
@@ -212,13 +303,13 @@ if "quiz" in st.session_state:
 
     if st.session_state.get("quiz_info"):
         st.caption(st.session_state["quiz_info"])
-    st.button("Close this quiz", on_click=clear_quiz)
+    st.button("Close This Quiz", on_click=clear_quiz)
     st.stop()
 
 # ---------- Add a lecture ----------
 docs = db.list_documents(sb, course["id"])
 
-with st.expander("⬆️ Add a lecture", expanded=not docs):
+with st.expander("⬆️ Add a Lecture", expanded=not docs):
     uploaded = st.file_uploader(
         "PDF or PowerPoint", type=["pdf", "pptx"],
         key=f"uploader_{st.session_state.get('uploader_n', 0)}",
@@ -228,7 +319,7 @@ with st.expander("⬆️ Add a lecture", expanded=not docs):
             st.error(f"That file is over {MAX_MB} MB. Please choose a smaller one.")
         elif any(d["filename"] == uploaded.name for d in docs):
             st.warning("A lecture with this file name is already in this course.")
-        elif st.button("Save lecture to this course"):
+        elif st.button("Save Lecture to This Course", type="primary"):
             if run_safely(add_lecture, course, uploaded):
                 st.rerun()
 
@@ -237,7 +328,7 @@ if not docs:
     st.stop()
 
 # ---------- Pick a lecture ----------
-labels = {d["id"]: f"{d['filename']}  ({d['created_at'][:10]})" for d in docs}
+labels = {d["id"]: f"{d['filename']} · {db.short_date(d['created_at'])}" for d in docs}
 doc_id = st.selectbox("Lecture", list(labels), format_func=labels.get, key=f"doc_{course['id']}")
 doc = load_doc(doc_id)
 
@@ -245,10 +336,15 @@ if st.session_state.get("active_doc") != doc_id:
     st.session_state.pop("notes_info", None)
     st.session_state["active_doc"] = doc_id
 
-use_strong = st.checkbox("Use the stronger model (about 20x the price)")
-model = MODEL_STRONG if use_strong else MODEL_CHEAP
+# ---------- Data shared by the tabs (fetched once per click) ----------
+saved = db.list_quizzes(sb, doc_id)
+by_id = {q["id"]: q for q in saved}
+flagged = db.list_flagged_keys(sb, course["id"])
+missed = [m for m in db.list_missed(sb, course["id"]) if m["question_key"] not in flagged]
+today = db.today().isoformat()
+due = [m for m in missed if m["due_on"] <= today]
 
-tab_notes, tab_quiz, tab_revise = st.tabs(["📝 Notes", "❓ Quiz", "🔁 Revise & practise"])
+tab_notes, tab_quiz, tab_revise = st.tabs(["📝 Notes", "❓ Quiz", "🔁 Revise & Practise"])
 
 # ---------- Notes ----------
 with tab_notes:
@@ -257,52 +353,66 @@ with tab_notes:
         if st.session_state.get("notes_info"):
             st.caption(st.session_state["notes_info"])
         st.caption("These notes are a first draft. Check numbers against your original slides.")
-    elif st.button("📝 Make study notes"):
-        if run_safely(make_notes, doc, model):
+    elif st.button("📝 Make Study Notes", type="primary"):
+        if run_safely(make_notes, doc, MODEL_CHEAP):
             st.rerun()
 
 # ---------- Quiz ----------
 with tab_quiz:
-    n_questions = st.slider("Number of quiz questions", 4, 12, 8)
-    if st.button("❓ Make a new quiz"):
-        if run_safely(make_quiz, course, doc, model, n_questions):
+    with st.container(border=True):
+        st.subheader("New Quiz")
+        # A form: nothing happens until "Make Quiz" is clicked
+        with st.form("new_quiz_form"):
+            name_box = f"quiz_name_{doc_id}_{st.session_state.get('quiz_name_n', 0)}"
+            new_quiz_name = st.text_input(
+                "Quiz Name", key=name_box, max_chars=MAX_NAME_LENGTH,
+                placeholder="For example: Chapter 3 Practice (blank uses the PDF's name)",
+            )
+            n_questions = st.slider("Number of Questions", 4, 12, 8)
+            model_label = st.selectbox(
+                "Claude Model", list(MODEL_CHOICES),
+                help="The stronger model costs about 20 times more. Best for hard material such as calculations.",
+            )
+            make_clicked = st.form_submit_button("❓ Make Quiz", type="primary")
+
+    if make_clicked:
+        if run_safely(make_quiz, course, doc, MODEL_CHOICES[model_label], n_questions, new_quiz_name):
+            st.session_state["quiz_name_n"] = st.session_state.get("quiz_name_n", 0) + 1  # empty the name box
             st.rerun()
 
-    saved = db.list_quizzes(sb, doc_id)
     if saved:
         st.divider()
-        by_id = {q["id"]: q for q in saved}
-        quiz_labels = {
-            q["id"]: f"{q['created_at'][:10]}: {len(q['questions'])} questions" for q in saved
-        }
-        chosen = st.selectbox("Saved quizzes", list(quiz_labels), format_func=quiz_labels.get,
+        st.subheader("Saved Quizzes")
+        quiz_labels = quiz_labels_for(doc["filename"], saved)
+        chosen = st.selectbox("Choose a Quiz", list(quiz_labels), format_func=quiz_labels.get,
                               key=f"saved_quiz_{doc_id}")
-        st.button("Open quiz", on_click=open_quiz, args=(by_id[chosen],))
+        st.button("Open Quiz", on_click=open_quiz,
+                  args=(by_id[chosen], quiz_name(by_id[chosen], doc["filename"])))
 
-        history = [a for a in db.recent_attempts(sb) if a["quiz_id"] in by_id][:5]
-        if history:
-            st.write("**Your recent scores**")
-            for a in history:
-                st.write(f"- {a['created_at'][:10]}: {a['score']} / {a['total']}")
+    # The dashboard: this lecture's attempts (newest first) and its open mistakes
+    st.divider()
+    attempts = [a for a in db.recent_attempts(sb) if a["quiz_id"] in by_id]
+    lecture_keys = {db.question_key(q["question"]) for row in saved for q in row["questions"]}
+    lecture_missed = [m for m in missed if m["question_key"] in lecture_keys]
+    render_dashboard(attempts, by_id, doc["filename"], lecture_missed, today)
 
-# ---------- Revise & practise (whole course) ----------
+# ---------- Revise & Practise (whole course) ----------
 with tab_revise:
-    flagged = db.list_flagged_keys(sb, course["id"])
-    missed = [m for m in db.list_missed(sb, course["id"]) if m["question_key"] not in flagged]
-    today = db.today().isoformat()
-    due = [m for m in missed if m["due_on"] <= today]
+    st.subheader("🔁 Spaced Revision")
+    count_due, count_later = st.columns(2)
+    count_due.metric("Due Today", len(due))
+    count_later.metric("Scheduled Later", len(missed) - len(due))
 
-    st.write("**🔁 Spaced revision**")
     if not missed:
         st.success("Nothing to revise yet. Questions you get wrong in quizzes collect here.")
     elif due:
-        st.write(f"**{len(due)} question(s) due today**, {len(missed) - len(due)} scheduled for later.")
         for topic, number in Counter(m["topic"] for m in due).most_common():
             st.write(f"- {safe(topic)} ({number})")
-        st.button("🔁 Start revision round", on_click=start_revision, args=(due,))
+        st.button("🔁 Start Revision Round", on_click=start_revision, args=(due,), type="primary")
     else:
-        st.success(f"Nothing due today. Your next review is on {min(m['due_on'] for m in missed)}.")
-        st.button("Practise early", on_click=start_revision, args=(missed,))
+        st.success(f"Nothing due today. Your next review is on "
+                   f"{db.short_date(min(m['due_on'] for m in missed))}.")
+        st.button("Practise Early", on_click=start_revision, args=(missed,))
         st.caption("Early practice doesn't count towards mastering a question, but mistakes are still recorded.")
     st.caption(
         f"A revision round replays up to {REVISION_SIZE} questions. A missed question is due straight away. "
@@ -311,9 +421,9 @@ with tab_revise:
     )
 
     st.divider()
-    st.write("**🔀 Mixed practice**")
+    st.subheader("🔀 Mixed Practice")
     st.caption(f"A random mix of up to {REVISION_SIZE} questions from all your saved quizzes in this course. "
                "Free (no Claude call).")
-    if st.button("🔀 Start mixed practice"):
+    if st.button("🔀 Start Mixed Practice"):
         if run_safely(start_mixed, course["id"]):
             st.rerun()

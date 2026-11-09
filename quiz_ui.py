@@ -26,7 +26,7 @@ def _choose(question_number, option_number):
 
 
 def _next():
-    """Runs when 'Next question' is clicked: move on one question."""
+    """Runs when 'Next Question' is clicked: move on one question."""
     st.session_state["quiz_index"] += 1
 
 
@@ -54,8 +54,11 @@ def render_quiz(questions, on_flag=None):
     answered = index in answers
 
     st.progress(index / total, text=f"Question {index + 1} of {total}")
-    st.caption("Topic: " + safe(q["topic"]))
-    st.markdown("**" + safe(q["question"]) + "**")
+
+    # The question sits in a card
+    with st.container(border=True):
+        st.caption("Topic: " + safe(q["topic"]))
+        st.markdown("**" + safe(q["question"]) + "**")
 
     # One button per option
     for j, option in enumerate(q["options"]):
@@ -87,10 +90,10 @@ def render_quiz(questions, on_flag=None):
             if index in flagged:
                 st.caption("🚩 Reported. It won't come back in revision or mixed practice.")
             else:
-                st.button("🚩 This question looks wrong", key=f"flag{index}",
+                st.button("🚩 Report This Question", key=f"flag{index}",
                           on_click=_flag, args=(index, q, on_flag))
 
-        next_label = "Next question" if index + 1 < total else "Finish quiz"
+        next_label = "Next Question" if index + 1 < total else "Finish Quiz"
         st.button(next_label, on_click=_next, type="primary")
 
 
@@ -117,7 +120,7 @@ def render_results(questions):
     score = total - len(wrong)
     percent = round(100 * score / total)
 
-    st.header(f"Your score: {score} / {total}  ({percent}%)")
+    st.header(f"Your Score: {score} / {total}  ({percent}%)")
     st.progress(score / total)
 
     if percent == 100:
@@ -129,12 +132,12 @@ def render_results(questions):
         st.warning("Worth another pass. Review the mistakes below, then retake.")
 
     if wrong:
-        st.subheader("Topics to revise")
+        st.subheader("Topics to Revise")
         counts = Counter(w["topic"] for w in wrong)
         for topic, number in counts.most_common():
             st.write(f"- {safe(topic)} ({number} wrong)")
 
-        st.subheader("Your mistakes")
+        st.subheader("Your Mistakes")
         for w in wrong:
             with st.expander(safe(w["question"])):
                 if w["picked_index"] is not None:
@@ -144,6 +147,6 @@ def render_results(questions):
 
     col1, col2 = st.columns(2)
     with col1:
-        st.button("Retake this quiz", on_click=start_quiz, use_container_width=True)
+        st.button("Retake This Quiz", on_click=start_quiz, use_container_width=True)
     with col2:
-        st.button("Make a new quiz", on_click=clear_quiz, use_container_width=True)
+        st.button("Make a New Quiz", on_click=clear_quiz, use_container_width=True)
