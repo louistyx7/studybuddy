@@ -1,0 +1,9 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+.spyproject/
+.DS_Store
+*.pdf
+*.pptx
+db_test.py
+quiz_test.py
