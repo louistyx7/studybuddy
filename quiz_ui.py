@@ -10,12 +10,13 @@ def start_quiz():
     st.session_state["quiz_index"] = 0      # which question we are on (0 = the first)
     st.session_state["quiz_answers"] = {}   # {question number: option the person clicked}
     st.session_state.pop("attempt_saved", None)   # so a retake saves a fresh score
+    st.session_state["flagged_qs"] = set()  # questions reported during this run
 
 
 def clear_quiz():
     """Throw away the current quiz and all its progress."""
     for key in ["quiz", "quiz_id", "quiz_title", "quiz_info", "quiz_index",
-            "quiz_answers", "wrong_answers", "attempt_saved"]:
+                "quiz_answers", "wrong_answers", "attempt_saved", "flagged_qs"]:
         st.session_state.pop(key, None)
 
 
@@ -29,7 +30,13 @@ def _next():
     st.session_state["quiz_index"] += 1
 
 
-def render_quiz(questions):
+def _flag(question_number, q, on_flag):
+    """Runs when the report button is clicked. on_flag saves it and returns True if it worked."""
+    if on_flag(q):
+        st.session_state["flagged_qs"].add(question_number)
+
+
+def render_quiz(questions, on_flag=None):
     """Draw the current question. Shows feedback once an option is clicked."""
     if "quiz_index" not in st.session_state:
         start_quiz()
@@ -67,13 +74,21 @@ def render_quiz(questions):
             use_container_width=True,
         )
 
-    # After answering: feedback, explanation, and a button to move on
+    # After answering: feedback, explanation, report button, and a button to move on
     if answered:
         if answers[index] == q["correct_index"]:
             st.success("Correct!")
         else:
             st.error("Not quite.")
         st.info(safe(q["explanation"]))
+
+        if on_flag is not None:
+            flagged = st.session_state.setdefault("flagged_qs", set())
+            if index in flagged:
+                st.caption("🚩 Reported. It won't come back in revision or mixed practice.")
+            else:
+                st.button("🚩 This question looks wrong", key=f"flag{index}",
+                          on_click=_flag, args=(index, q, on_flag))
 
         next_label = "Next question" if index + 1 < total else "Finish quiz"
         st.button(next_label, on_click=_next, type="primary")
@@ -84,7 +99,7 @@ def render_results(questions):
     answers = st.session_state["quiz_answers"]
     total = len(questions)
 
-    # Build a list of everything the person got wrong (used by "revise mistakes" in Stage 7)
+    # Build a list of everything the person got wrong
     wrong = []
     for i, q in enumerate(questions):
         picked = answers.get(i)

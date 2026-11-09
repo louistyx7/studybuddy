@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Nov  9 15:24:28 2026
-
-@author: louis
+db.py - everything that talks to the Supabase database.
 """
 import hashlib
+from datetime import datetime, timedelta, timezone
+
+# Singapore time (UTC+8, no daylight saving), so "today" matches your day
+SGT = timezone(timedelta(hours=8))
+
+# Spaced revision: after the 1st correct answer a question waits 1 day, after the
+# 2nd it waits 3 days, and the 3rd correct answer counts as mastered.
+SPACING_DAYS = {1: 1, 2: 3}
+MASTER_AFTER = 3
+
+
+def today():
+    """Today's date in Singapore."""
+    return datetime.now(SGT).date()
+
+
 def list_courses(sb):
     return sb.table("courses").select("*").order("created_at").execute().data
 
@@ -69,6 +83,7 @@ def recent_attempts(sb):
         .data
     )
 
+
 def question_key(text):
     """A short fingerprint of a question, so the same question is recognised next time."""
     return hashlib.md5(text.strip().lower().encode("utf-8")).hexdigest()
@@ -84,28 +99,78 @@ def list_missed(sb, course_id):
 
 
 def record_results(sb, course_id, questions, answers):
-    """After a quiz: save new mistakes, and mark old mistakes as mastered if now answered correctly."""
+    """After a quiz: save new mistakes and move old ones along the spaced-revision schedule."""
     keyed = {}
     for i, q in enumerate(questions):
         keyed[question_key(q["question"])] = (q, answers.get(i) == q["correct_index"])
 
     existing = (
-        sb.table("missed_questions").select("id, question_key, times_wrong, mastered")
+        sb.table("missed_questions")
+        .select("id, question_key, times_wrong, mastered, box, due_on")
         .eq("course_id", course_id).in_("question_key", list(keyed))
         .execute().data
     )
     by_key = {r["question_key"]: r for r in existing}
+    now = today()
 
     for key, (q, was_right) in keyed.items():
         row = by_key.get(key)
         if was_right:
-            if row and not row["mastered"]:
-                sb.table("missed_questions").update({"mastered": True}).eq("id", row["id"]).execute()
+            # A correct answer only counts if the question was due. This stops
+            # you "mastering" a question by repeating it several times in one sitting.
+            if row and not row["mastered"] and row["due_on"] <= now.isoformat():
+                box = row["box"] + 1
+                if box >= MASTER_AFTER:
+                    change = {"mastered": True, "box": box}
+                else:
+                    wait = timedelta(days=SPACING_DAYS[box])
+                    change = {"box": box, "due_on": (now + wait).isoformat()}
+                sb.table("missed_questions").update(change).eq("id", row["id"]).execute()
         elif row:
+            # Wrong again: start over, and it is due straight away
             sb.table("missed_questions").update(
-                {"mastered": False, "times_wrong": row["times_wrong"] + 1, "question": q}
+                {"mastered": False, "times_wrong": row["times_wrong"] + 1, "question": q,
+                 "box": 0, "due_on": now.isoformat()}
             ).eq("id", row["id"]).execute()
         else:
             sb.table("missed_questions").insert(
-                {"course_id": course_id, "question_key": key, "topic": q["topic"], "question": q}
+                {"course_id": course_id, "question_key": key, "topic": q["topic"], "question": q,
+                 "box": 0, "due_on": now.isoformat()}
             ).execute()
+
+
+def list_course_questions(sb, course_id):
+    """Every question from every saved quiz in this course, with duplicates removed."""
+    ids = [d["id"] for d in list_documents(sb, course_id)]
+    if not ids:
+        return []
+    rows = sb.table("quizzes").select("questions").in_("document_id", ids).execute().data
+    seen = set()
+    found = []
+    for row in rows:
+        for q in row["questions"]:
+            key = question_key(q["question"])
+            if key not in seen:
+                seen.add(key)
+                found.append(q)
+    return found
+
+
+def flag_question(sb, course_id, q):
+    """Report a question as wrong or unclear, so it stops coming back."""
+    row = {"course_id": course_id, "question_key": question_key(q["question"]), "question": q}
+    try:
+        sb.table("flagged_questions").insert(row).execute()
+    except Exception as error:
+        # Reporting the same question twice is fine. Anything else is a real problem.
+        if "duplicate" not in str(error).lower() and "23505" not in str(error):
+            raise
+
+
+def list_flagged_keys(sb, course_id):
+    """The fingerprints of every question this person has reported in this course."""
+    rows = (
+        sb.table("flagged_questions").select("question_key")
+        .eq("course_id", course_id).execute().data
+    )
+    return {r["question_key"] for r in rows}

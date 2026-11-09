@@ -109,16 +109,51 @@ def open_quiz(row):
     start_quiz()
 
 
-def start_revision(missed):
-    """Runs when 'Start revision' is clicked: replay the most-missed questions (free)."""
-    chosen = sorted(missed, key=lambda m: -m["times_wrong"])[:REVISION_SIZE]
-    questions = [m["question"] for m in chosen]
+def reshuffled(q):
+    """A copy of a question with its options in a new order, so you can't just remember the position."""
+    correct_text = q["options"][q["correct_index"]]
+    options = q["options"][:]
+    random.shuffle(options)
+    return {**q, "options": options, "correct_index": options.index(correct_text)}
+
+
+def start_revision(candidates):
+    """Runs when a revision button is clicked: replay up to REVISION_SIZE questions (free)."""
+    chosen = sorted(candidates, key=lambda m: -m["times_wrong"])[:REVISION_SIZE]
+    questions = [reshuffled(m["question"]) for m in chosen]
     random.shuffle(questions)
     clear_quiz()
     st.session_state["quiz"] = questions
     st.session_state["quiz_id"] = None  # a revision round is not a saved quiz
     st.session_state["quiz_title"] = "🔁 Revision round"
     start_quiz()
+
+
+def start_mixed(course_id):
+    """Mixed practice: a random mix of questions from every saved quiz in the course (free)."""
+    flagged = db.list_flagged_keys(sb, course_id)
+    pool = [q for q in db.list_course_questions(sb, course_id)
+            if db.question_key(q["question"]) not in flagged]
+    if len(pool) < 4:
+        raise ValueError("Make a few quizzes in this course first, then come back for mixed practice.")
+    questions = [reshuffled(q) for q in random.sample(pool, min(REVISION_SIZE, len(pool)))]
+    clear_quiz()
+    st.session_state["quiz"] = questions
+    st.session_state["quiz_id"] = None
+    st.session_state["quiz_title"] = "🔀 Mixed practice"
+    start_quiz()
+
+
+def flag_question(course_id, q):
+    """Runs when 'This question looks wrong' is clicked. Returns True if it was saved."""
+    try:
+        db.flag_question(sb, course_id, q)
+        st.toast("Thanks, reported. It won't come back in revision or mixed practice.")
+        return True
+    except Exception as error:
+        print("Flagging failed:", error)
+        st.toast("Could not save that report. Please try again.")
+        return False
 
 
 def save_result(course_id, quiz):
@@ -168,7 +203,7 @@ if "quiz" in st.session_state:
     quiz = st.session_state["quiz"]
     if st.session_state.get("quiz_title"):
         st.subheader(st.session_state["quiz_title"])
-    render_quiz(quiz)
+    render_quiz(quiz, on_flag=lambda q: flag_question(course["id"], q))
 
     # Save the result once, the first time the results screen appears
     if st.session_state["quiz_index"] >= len(quiz) and not st.session_state.get("attempt_saved"):
@@ -213,7 +248,7 @@ if st.session_state.get("active_doc") != doc_id:
 use_strong = st.checkbox("Use the stronger model (about 20x the price)")
 model = MODEL_STRONG if use_strong else MODEL_CHEAP
 
-tab_notes, tab_quiz, tab_revise = st.tabs(["📝 Notes", "❓ Quiz", "🔁 Revise mistakes"])
+tab_notes, tab_quiz, tab_revise = st.tabs(["📝 Notes", "❓ Quiz", "🔁 Revise & practise"])
 
 # ---------- Notes ----------
 with tab_notes:
@@ -250,17 +285,35 @@ with tab_quiz:
             for a in history:
                 st.write(f"- {a['created_at'][:10]}: {a['score']} / {a['total']}")
 
-# ---------- Revise mistakes (whole course) ----------
+# ---------- Revise & practise (whole course) ----------
 with tab_revise:
-    missed = db.list_missed(sb, course["id"])
+    flagged = db.list_flagged_keys(sb, course["id"])
+    missed = [m for m in db.list_missed(sb, course["id"]) if m["question_key"] not in flagged]
+    today = db.today().isoformat()
+    due = [m for m in missed if m["due_on"] <= today]
+
+    st.write("**🔁 Spaced revision**")
     if not missed:
         st.success("Nothing to revise yet. Questions you get wrong in quizzes collect here.")
-    else:
-        st.write(f"**{len(missed)} question(s)** from this course still to master.")
-        for topic, number in Counter(m["topic"] for m in missed).most_common():
+    elif due:
+        st.write(f"**{len(due)} question(s) due today**, {len(missed) - len(due)} scheduled for later.")
+        for topic, number in Counter(m["topic"] for m in due).most_common():
             st.write(f"- {safe(topic)} ({number})")
-        st.caption(
-            f"A revision round replays up to {REVISION_SIZE} of your most-missed questions. "
-            "It is free (no Claude call). Answer one correctly and it leaves this list."
-        )
-        st.button("🔁 Start revision round", on_click=start_revision, args=(missed,))
+        st.button("🔁 Start revision round", on_click=start_revision, args=(due,))
+    else:
+        st.success(f"Nothing due today. Your next review is on {min(m['due_on'] for m in missed)}.")
+        st.button("Practise early", on_click=start_revision, args=(missed,))
+        st.caption("Early practice doesn't count towards mastering a question, but mistakes are still recorded.")
+    st.caption(
+        f"A revision round replays up to {REVISION_SIZE} questions. A missed question is due straight away. "
+        "Answer it correctly when it's due and it returns after 1 day, then 3 days, then counts as "
+        "mastered. A wrong answer starts it over. Free (no Claude call)."
+    )
+
+    st.divider()
+    st.write("**🔀 Mixed practice**")
+    st.caption(f"A random mix of up to {REVISION_SIZE} questions from all your saved quizzes in this course. "
+               "Free (no Claude call).")
+    if st.button("🔀 Start mixed practice"):
+        if run_safely(start_mixed, course["id"]):
+            st.rerun()
