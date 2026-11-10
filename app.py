@@ -116,10 +116,30 @@ def sort_docs(items, how):
     return sorted(items, key=lambda d: d["created_at"], reverse=True)
 
 
-# ---------- Course, module and lecture actions (used by buttons) ----------
-def create_course(name, style):
-    row = db.add_course(sb, name.strip(), style)
+def module_label(value, docs, module_by_id, unsorted_count):
+    if value == "all":
+        return f"📚 All Lectures ({len(docs)})"
+    if value == "none":
+        return f"📂 Unsorted ({unsorted_count})"
+    m = module_by_id[value]
+    count = sum(1 for d in docs if d["module_id"] == value)
+    return f"{colour_info(m['colour'])[0]} {m['name']} ({count})"
+
+
+def doc_label(d, module_by_id, selected):
+    m = module_by_id.get(d["module_id"])
+    tag = f"{colour_info(m['colour'])[0]} " if (m and selected == "all") else ""
+    return f"{tag}{d['filename']}"
+
+
+# ---------- Actions (all run from buttons) ----------
+def do_create_course():
+    name = st.session_state.get("new_course_name", "").strip()
+    if not name:
+        raise ValueError("Please type a course name.")
+    row = db.add_course(sb, name, st.session_state.get("new_course_style", "general"))
     st.session_state["course_id"] = row["id"]  # select the new course
+    st.session_state["new_course_name"] = ""
 
 
 def do_rename_course(course_id):
@@ -128,7 +148,7 @@ def do_rename_course(course_id):
 
 def do_delete_course(course_id):
     db.delete_course(sb, course_id)
-    for key in ("course_id", "loaded_doc", "active_doc", "active_course"):
+    for key in ("course_id", "loaded_doc", "active_doc", "nav_sig"):
         st.session_state.pop(key, None)
     clear_quiz()
 
@@ -193,14 +213,15 @@ def do_delete_doc(doc_id, course_id):
     st.session_state.pop(f"doc_{course_id}", None)
 
 
-def add_lecture(course, uploaded, module_id):
+def add_lecture(course, uploaded, module_id, has_modules):
     with st.spinner("Reading the file..."):
         text, pages = extract_text(uploaded, uploaded.name)
     if len(text.strip()) < 200:
         raise ValueError("I could not find much text. This file may be mostly images or a scan.")
     row = db.save_document(sb, course["id"], uploaded.name, pages, text, module_id)
-    st.session_state[f"doc_{course['id']}"] = row["id"]  # select the new lecture
-    st.session_state[f"mod_{course['id']}"] = module_id or "all"  # show it
+    # The sidebar is already drawn, so ask for the new lecture to be selected on the next run
+    show_in = module_id if module_id else ("none" if has_modules else "all")
+    st.session_state["_goto"] = (course["id"], show_in, row["id"])
     st.session_state["uploader_n"] = st.session_state.get("uploader_n", 0) + 1  # empty the uploader
 
 
@@ -212,6 +233,77 @@ def load_doc(doc_id):
     row = db.get_document(sb, doc_id)
     st.session_state["loaded_doc"] = row
     return row
+
+
+# ---------- Sidebar tools ----------
+def sidebar_course_tools(course):
+    cid = course["id"]
+    with st.expander("✏️ Edit Course"):
+        st.text_input("Course Name", value=course["name"], key=f"rn_course_{cid}")
+        st.button("Rename Course", key=f"rn_course_btn_{cid}", use_container_width=True, on_click=act,
+                  args=(do_rename_course, cid), kwargs={"done": "Course renamed."})
+        st.divider()
+        ok = st.checkbox("Yes, permanently delete this course and everything in it.", key=f"cf_delcourse_{cid}")
+        st.caption("This deletes its modules, lectures, guides, quizzes and revision history.")
+        st.button("🗑️ Delete Course", key=f"del_course_{cid}", disabled=not ok, use_container_width=True,
+                  on_click=act, args=(do_delete_course, cid), kwargs={"done": "Course deleted."})
+
+
+def sidebar_module_tools(course, modules, module_by_id, selected):
+    cid = course["id"]
+    colour_keys = list(MODULE_COLOURS)
+    with st.expander("➕ Add Module"):
+        st.caption("A module is a section inside a course, for example Neurobiology 1. Each gets its own colour.")
+        st.text_input("Module Name", key=f"new_mod_name_{cid}", placeholder="For example: Neurobiology 1")
+        st.selectbox("Colour", colour_keys, index=colour_keys.index(next_free_colour(modules)),
+                     format_func=colour_label, key=f"new_mod_colour_{cid}")
+        st.button("Add Module", key=f"add_mod_{cid}", use_container_width=True, on_click=act,
+                  args=(do_add_module, course), kwargs={"done": "Module added."})
+
+    if selected in module_by_id:
+        m = module_by_id[selected]
+        mid = m["id"]
+        index = [x["id"] for x in modules].index(mid)
+        with st.expander("✏️ Edit This Module"):
+            st.text_input("Module Name", value=m["name"], key=f"rn_mod_{mid}")
+            st.selectbox("Colour", colour_keys,
+                         index=colour_keys.index(m["colour"]) if m["colour"] in colour_keys else 0,
+                         format_func=colour_label, key=f"col_mod_{mid}")
+            st.button("Save Changes", key=f"save_mod_{mid}", use_container_width=True, on_click=act,
+                      args=(do_update_module, mid), kwargs={"done": "Module saved."})
+            u1, u2 = st.columns(2)
+            u1.button("▲ Up", key=f"up_{mid}", disabled=index == 0, use_container_width=True,
+                      on_click=act, args=(do_move_module, cid, mid, -1))
+            u2.button("▼ Down", key=f"down_{mid}", disabled=index == len(modules) - 1,
+                      use_container_width=True, on_click=act, args=(do_move_module, cid, mid, 1))
+            st.divider()
+            ok = st.checkbox("Yes, delete this module.", key=f"cf_delmod_{mid}")
+            st.caption("Its lectures are kept and move to Unsorted.")
+            st.button("🗑️ Delete Module", key=f"del_mod_{mid}", disabled=not ok, use_container_width=True,
+                      on_click=act, args=(do_delete_module, cid, mid), kwargs={"done": "Module deleted."})
+
+
+def sidebar_lecture_tools(course, doc_row, modules, module_by_id):
+    did = doc_row["id"]
+    with st.expander("✏️ Edit This Lecture"):
+        st.text_input("Lecture Name", value=doc_row["filename"], key=f"rn_doc_{did}")
+        st.button("Rename Lecture", key=f"rn_doc_btn_{did}", use_container_width=True, on_click=act,
+                  args=(do_rename_doc, did), kwargs={"done": "Lecture renamed."})
+        if modules:
+            options = ["none"] + [m["id"] for m in modules]
+            current = doc_row.get("module_id") if doc_row.get("module_id") in module_by_id else "none"
+            st.selectbox(
+                "Move to Module", options, index=options.index(current), key=f"mv_doc_{did}",
+                format_func=lambda v: "📂 Unsorted" if v == "none"
+                else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
+            )
+            st.button("Move Lecture", key=f"mv_doc_btn_{did}", use_container_width=True, on_click=act,
+                      args=(do_move_doc, did, course["id"]), kwargs={"done": "Lecture moved."})
+        st.divider()
+        ok = st.checkbox("Yes, permanently delete this lecture.", key=f"cf_deldoc_{did}")
+        st.caption("This deletes its notes, study guide and quizzes.")
+        st.button("🗑️ Delete Lecture", key=f"del_doc_{did}", disabled=not ok, use_container_width=True,
+                  on_click=act, args=(do_delete_doc, did, course["id"]), kwargs={"done": "Lecture deleted."})
 
 
 # ---------- Notes, guides and quizzes ----------
@@ -443,120 +535,123 @@ def save_result(course_id, quiz):
     db.record_results(sb, course_id, quiz, answers)
 
 
-# ---------- Manage panels ----------
-def render_manage(course, modules, module_by_id, selected):
-    """Rename and delete the course; add, edit, reorder and delete modules."""
-    cid = course["id"]
-    colour_keys = list(MODULE_COLOURS)
-    with st.expander("⚙️ Manage Course and Modules"):
-        st.markdown("**Rename Course**")
-        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
-        c1.text_input("Course Name", value=course["name"], key=f"rn_course_{cid}")
-        c2.button("Rename", key=f"rn_course_btn_{cid}", use_container_width=True, on_click=act,
-                  args=(do_rename_course, cid), kwargs={"done": "Course renamed."})
-
-        st.divider()
-        st.markdown("**Add a Module**")
-        st.caption("Modules are sections inside a course, for example Neurobiology 1. Each gets its own colour.")
-        a1, a2, a3 = st.columns([3, 2, 1], vertical_alignment="bottom")
-        a1.text_input("Module Name", key=f"new_mod_name_{cid}", placeholder="For example: Neurobiology 1")
-        a2.selectbox("Colour", colour_keys, index=colour_keys.index(next_free_colour(modules)),
-                     format_func=colour_label, key=f"new_mod_colour_{cid}")
-        a3.button("Add", key=f"add_mod_{cid}", use_container_width=True, on_click=act,
-                  args=(do_add_module, course), kwargs={"done": "Module added."})
-
-        if selected in module_by_id:
-            m = module_by_id[selected]
-            mid = m["id"]
-            index = [x["id"] for x in modules].index(mid)
-            st.divider()
-            st.markdown("**Edit the Selected Module**")
-            e1, e2, e3 = st.columns([3, 2, 1], vertical_alignment="bottom")
-            e1.text_input("Module Name", value=m["name"], key=f"rn_mod_{mid}")
-            e2.selectbox("Colour", colour_keys,
-                         index=colour_keys.index(m["colour"]) if m["colour"] in colour_keys else 0,
-                         format_func=colour_label, key=f"col_mod_{mid}")
-            e3.button("Save", key=f"save_mod_{mid}", use_container_width=True, on_click=act,
-                      args=(do_update_module, mid), kwargs={"done": "Module saved."})
-            b1, b2 = st.columns(2)
-            b1.button("◀ Move Left", key=f"left_{mid}", disabled=index == 0, use_container_width=True,
-                      on_click=act, args=(do_move_module, cid, mid, -1))
-            b2.button("Move Right ▶", key=f"right_{mid}", disabled=index == len(modules) - 1,
-                      use_container_width=True, on_click=act, args=(do_move_module, cid, mid, 1))
-            ok = st.checkbox("I understand: the lectures in this module move to Unsorted (they are not deleted).",
-                             key=f"cf_delmod_{mid}")
-            st.button("🗑️ Delete This Module", key=f"del_mod_{mid}", disabled=not ok, on_click=act,
-                      args=(do_delete_module, cid, mid), kwargs={"done": "Module deleted."})
-
-        st.divider()
-        st.markdown("**Danger Zone**")
-        ok = st.checkbox("I understand this permanently deletes this course and everything in it "
-                         "(modules, lectures, guides, quizzes and revision history).", key=f"cf_delcourse_{cid}")
-        st.button("🗑️ Delete This Course", key=f"del_course_{cid}", disabled=not ok, on_click=act,
-                  args=(do_delete_course, cid), kwargs={"done": "Course deleted."})
-
-
-def render_lecture_manage(course, doc, modules, module_by_id):
-    """Rename, move or delete the selected lecture."""
-    did = doc["id"]
-    with st.expander("⚙️ Manage This Lecture"):
-        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
-        c1.text_input("Lecture Name", value=doc["filename"], key=f"rn_doc_{did}")
-        c2.button("Rename", key=f"rn_doc_btn_{did}", use_container_width=True, on_click=act,
-                  args=(do_rename_doc, did), kwargs={"done": "Lecture renamed."})
-        if modules:
-            options = ["none"] + [m["id"] for m in modules]
-            current = doc.get("module_id") if doc.get("module_id") in module_by_id else "none"
-            m1, m2 = st.columns([3, 1], vertical_alignment="bottom")
-            m1.selectbox(
-                "Move to Module", options, index=options.index(current), key=f"mv_doc_{did}",
-                format_func=lambda v: "📂 Unsorted" if v == "none"
-                else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
-            )
-            m2.button("Move", key=f"mv_doc_btn_{did}", use_container_width=True, on_click=act,
-                      args=(do_move_doc, did, course["id"]), kwargs={"done": "Lecture moved."})
-        ok = st.checkbox("I understand this permanently deletes this lecture, its notes, study guide and quizzes.",
-                         key=f"cf_deldoc_{did}")
-        st.button("🗑️ Delete This Lecture", key=f"del_doc_{did}", disabled=not ok, on_click=act,
-                  args=(do_delete_doc, did, course["id"]), kwargs={"done": "Lecture deleted."})
-
-
-# ---------- Sidebar: courses ----------
+# =====================================================================
+# SIDEBAR: the navigator (courses > modules > lectures) and all editing
+# =====================================================================
 courses = db.list_courses(sb)
+course = None
+modules, module_by_id, docs = [], {}, []
+selected = "all"
+doc_id = None
 
 with st.sidebar:
     st.divider()
-    with st.expander("➕ New Course", expanded=not courses):
-        new_name = st.text_input("Course Name", key="new_course_name")
-        new_style = st.selectbox("Course Type", list(STYLE_LABELS), format_func=STYLE_LABELS.get,
-                                 key="new_course_style")
-        if st.button("Create Course"):
-            if not new_name.strip():
-                st.error("Please type a course name.")
-            elif run_safely(create_course, new_name, new_style):
-                st.rerun()
-
+    st.markdown("##### 📚 Course")
     if courses:
         names = {c["id"]: c["name"] for c in courses}
-        st.selectbox("Course", list(names), format_func=names.get, key="course_id")
+        st.selectbox("Course", list(names), format_func=names.get, key="course_id",
+                     label_visibility="collapsed")
+        course = next(c for c in courses if c["id"] == st.session_state["course_id"])
+        sidebar_course_tools(course)
 
+    with st.expander("➕ New Course", expanded=not courses):
+        st.text_input("Course Name", key="new_course_name")
+        st.selectbox("Course Type", list(STYLE_LABELS), format_func=STYLE_LABELS.get, key="new_course_style")
+        st.button("Create Course", use_container_width=True, on_click=act,
+                  args=(do_create_course,), kwargs={"done": "Course created."})
+
+    if course:
+        modules = db.list_modules(sb, course["id"])
+        module_by_id = {m["id"]: m for m in modules}
+        docs = db.list_documents(sb, course["id"])
+        mod_key = f"mod_{course['id']}"
+        doc_key = f"doc_{course['id']}"
+
+        # After an upload, jump to the new lecture
+        goto = st.session_state.pop("_goto", None)
+        if goto and goto[0] == course["id"]:
+            st.session_state[mod_key] = goto[1]
+            st.session_state[doc_key] = goto[2]
+
+        unsorted_count = sum(1 for d in docs if d["module_id"] not in module_by_id)
+        options = ["all"] + [m["id"] for m in modules] + (["none"] if modules and unsorted_count else [])
+        if st.session_state.get(mod_key, "all") not in options:
+            st.session_state[mod_key] = "all"
+
+        st.divider()
+        st.markdown("##### 🗂️ Modules")
+        if modules:
+            selected = st.radio(
+                "Module", options, key=mod_key, label_visibility="collapsed",
+                format_func=lambda v: module_label(v, docs, module_by_id, unsorted_count),
+            )
+        else:
+            st.caption("No modules yet. Add one to organise this course by topic.")
+        sidebar_module_tools(course, modules, module_by_id, selected)
+
+        if selected == "all":
+            shown = docs
+        elif selected == "none":
+            shown = [d for d in docs if d["module_id"] not in module_by_id]
+        else:
+            shown = [d for d in docs if d["module_id"] == selected]
+
+        st.divider()
+        st.markdown("##### 📄 Lectures")
+        if shown:
+            sort_by = st.selectbox("Sort Lectures", SORTS, key=f"sort_{course['id']}",
+                                   label_visibility="collapsed")
+            ordered = sort_docs(shown, sort_by)
+            labels = {d["id"]: doc_label(d, module_by_id, selected) for d in ordered}
+            if st.session_state.get(doc_key) not in labels:
+                st.session_state.pop(doc_key, None)  # the chosen lecture is not in this module
+            doc_id = st.radio("Lecture", list(labels), format_func=labels.get, key=doc_key,
+                              label_visibility="collapsed")
+            sidebar_lecture_tools(course, next(d for d in docs if d["id"] == doc_id), modules, module_by_id)
+        else:
+            st.caption("No lectures here yet. Add one from the main page.")
+
+# =====================================================================
+# MAIN PAGE: upload, notes, quizzes
+# =====================================================================
 if not courses:
     st.title("📚 StudyBuddy")
     st.info("Create your first course in the sidebar to get started.")
     st.stop()
 
-course = next(c for c in courses if c["id"] == st.session_state["course_id"])
-modules = db.list_modules(sb, course["id"])
-module_by_id = {m["id"]: m for m in modules}
+doc = load_doc(doc_id) if doc_id else None
+lecture_module = module_by_id.get(doc.get("module_id")) if doc else module_by_id.get(selected)
+accent = colour_info(lecture_module["colour"])[1] if lecture_module else STYLE_ACCENTS[course["style"]]
+
+# Clicking a different course, module or lecture closes any open quiz
+nav_sig = (course["id"], selected, doc_id)
+if st.session_state.get("nav_sig") != nav_sig:
+    if "nav_sig" in st.session_state and "quiz" in st.session_state:
+        clear_quiz()
+    st.session_state["nav_sig"] = nav_sig
+
+if st.session_state.get("active_doc") != doc_id:
+    st.session_state.pop("notes_info", None)
+    st.session_state.pop("guide_info", None)
+    st.session_state["active_doc"] = doc_id
+
 st.title(f"📚 {course['name']}")
 st.markdown(f":{STYLE_BADGES[course['style']]}-badge[{STYLE_LABELS[course['style']]} Course]")
 
-# A different course than last time? Close any open quiz.
-if st.session_state.get("active_course") != course["id"]:
-    clear_quiz()
-    st.session_state["active_course"] = course["id"]
+crumb = [course["name"]]
+if selected in module_by_id:
+    crumb.append(f"{colour_info(module_by_id[selected]['colour'])[0]} {module_by_id[selected]['name']}")
+elif selected == "none":
+    crumb.append("📂 Unsorted")
+if doc:
+    crumb.append(doc["filename"])
+st.markdown(
+    f'<div style="border-left:6px solid {accent};background:{accent}22;padding:8px 14px;'
+    f'border-radius:6px;font-weight:600">{html.escape(" › ".join(crumb))}</div>',
+    unsafe_allow_html=True,
+)
 
-# ---------- An open quiz takes over the whole page ----------
+# ---------- An open quiz takes over the page ----------
 if "quiz" in st.session_state:
     quiz = st.session_state["quiz"]
     if st.session_state.get("quiz_title"):
@@ -573,107 +668,36 @@ if "quiz" in st.session_state:
     st.button("Close This Quiz", on_click=clear_quiz)
     st.stop()
 
-docs = db.list_documents(sb, course["id"])
-mod_key = f"mod_{course['id']}"
-
 # ---------- Add a lecture ----------
-with st.expander("⬆️ Add a Lecture", expanded=not docs):
+with st.expander("⬆️ Add a Lecture", expanded=not docs or doc is None):
+    target_module = None
+    if modules:
+        if selected in module_by_id:
+            target_module = selected
+            where = f"{colour_info(module_by_id[selected]['colour'])[0]} {safe(module_by_id[selected]['name'])}"
+        else:
+            where = "📂 Unsorted"
+        st.caption(f"This lecture will be added to: **{where}**. "
+                   "To file it in a module, pick that module in the sidebar first.")
     uploaded = st.file_uploader(
         "PDF or PowerPoint", type=["pdf", "pptx"],
         key=f"uploader_{st.session_state.get('uploader_n', 0)}",
     )
-    target_module = None
-    if modules:
-        ids = ["none"] + [m["id"] for m in modules]
-        last = st.session_state.get(mod_key, "all")
-        choice = st.selectbox(
-            "Add to Module", ids, index=ids.index(last if last in module_by_id else "none"),
-            format_func=lambda v: "📂 Unsorted" if v == "none"
-            else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
-        )
-        target_module = None if choice == "none" else choice
     if uploaded is not None:
         if uploaded.size > MAX_MB * 1024 * 1024:
             st.error(f"That file is over {MAX_MB} MB. Please choose a smaller one.")
         elif any(d["filename"] == uploaded.name for d in docs):
             st.warning("A lecture with this file name is already in this course.")
         elif st.button("Save Lecture to This Course", type="primary"):
-            if run_safely(add_lecture, course, uploaded, target_module):
+            if run_safely(add_lecture, course, uploaded, target_module, bool(modules)):
                 st.rerun()
 
-# ---------- Module chips (the coloured sections) ----------
-unsorted_count = sum(1 for d in docs if d["module_id"] not in module_by_id)
-options = ["all"] + [m["id"] for m in modules] + (["none"] if modules and unsorted_count else [])
-
-
-def module_label(value):
-    if value == "all":
-        return f"📚 All Lectures ({len(docs)})"
-    if value == "none":
-        return f"📂 Unsorted ({unsorted_count})"
-    m = module_by_id[value]
-    count = sum(1 for d in docs if d["module_id"] == value)
-    return f"{colour_info(m['colour'])[0]} {m['name']} ({count})"
-
-
-if st.session_state.get(mod_key, "all") not in options:
-    st.session_state[mod_key] = "all"
-if modules:
-    selected = st.radio("Module", options, format_func=module_label, key=mod_key,
-                        horizontal=True, label_visibility="collapsed")
-else:
-    selected = "all"
-
-render_manage(course, modules, module_by_id, selected)
-
-if selected in module_by_id:
-    banner = module_by_id[selected]
-    hex_colour = colour_info(banner["colour"])[1]
-    st.markdown(
-        f'<div style="border-left:6px solid {hex_colour};background:{hex_colour}22;'
-        f'padding:8px 14px;border-radius:6px;font-weight:600">'
-        f'{colour_info(banner["colour"])[0]} {html.escape(banner["name"])}</div>',
-        unsafe_allow_html=True,
-    )
-
-# ---------- Pick a lecture ----------
-if selected == "all":
-    shown = docs
-elif selected == "none":
-    shown = [d for d in docs if d["module_id"] not in module_by_id]
-else:
-    shown = [d for d in docs if d["module_id"] == selected]
-
-if not shown:
-    st.info("No lectures here yet. Add one above." if docs else "No lectures in this course yet. Add one above.")
+if doc is None:
+    if docs:
+        st.info("No lectures here yet. Add one above, or pick another module in the sidebar.")
+    else:
+        st.info("No lectures in this course yet. Add one above.")
     st.stop()
-
-
-def doc_label(d):
-    m = module_by_id.get(d["module_id"])
-    tag = f"{colour_info(m['colour'])[0]} " if (m and selected == "all") else ""
-    return f"{tag}{d['filename']} · {db.short_date(d['created_at'])}"
-
-
-p1, p2 = st.columns([3, 1])
-sort_by = p2.selectbox("Sort", SORTS, key=f"sort_{course['id']}")
-ordered = sort_docs(shown, sort_by)
-labels = {d["id"]: doc_label(d) for d in ordered}
-doc_key = f"doc_{course['id']}"
-if st.session_state.get(doc_key) not in labels:
-    st.session_state.pop(doc_key, None)  # the chosen lecture is not in this module
-doc_id = p1.selectbox("Lecture", list(labels), format_func=labels.get, key=doc_key)
-doc = load_doc(doc_id)
-
-if st.session_state.get("active_doc") != doc_id:
-    st.session_state.pop("notes_info", None)
-    st.session_state.pop("guide_info", None)
-    st.session_state["active_doc"] = doc_id
-
-render_lecture_manage(course, doc, modules, module_by_id)
-
-lecture_module = module_by_id.get(doc.get("module_id"))
-accent = colour_info(lecture_module["colour"])[1] if lecture_module else STYLE_ACCENTS[course["style"]]
 
 # ---------- Data shared by the tabs (fetched once per click) ----------
 saved = db.list_quizzes(sb, doc_id)
