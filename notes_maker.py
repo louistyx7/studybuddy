@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 import anthropic
 
+from claude_call import call_with_tool
 from pdf_reader import extract_pdf_text  # the function from Step 3.1
 
 # Read the secret key from .env and open the connection to Claude
@@ -12,6 +13,9 @@ MODEL_CHEAP = "claude-haiku-5-5"
 
 # Most characters of lecture text we will send (keeps each request cheap)
 MAX_CHARS = 120_000
+
+# A ceiling, not a cost. Thinking tokens count towards it.
+NOTES_MAX_TOKENS = 16000
 
 # Standing instructions for how Claude should write the notes
 NOTES_INSTRUCTIONS = """You are a study-notes assistant for a university student.
@@ -101,14 +105,13 @@ def generate_notes(lecture_text, model=MODEL_CHEAP):
 
     # Try up to 2 times, in case the form comes back incomplete
     for attempt in range(2):
-        response = client.messages.create(
+        response = call_with_tool(
+            client,
             model=model,
-            max_tokens=8000,
             system=NOTES_INSTRUCTIONS,
-            tools=[NOTES_TOOL],
-            messages=[
-                {"role": "user", "content": "Here is the lecture text:\n\n" + lecture_text}
-            ],
+            user_text="Here is the lecture text:\n\n" + lecture_text,
+            tool=NOTES_TOOL,
+            max_tokens=NOTES_MAX_TOKENS,
         )
         total_in += response.usage.input_tokens
         total_out += response.usage.output_tokens

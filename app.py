@@ -1,10 +1,12 @@
 import config  # noqa: F401  (loads the keys before anything else needs them)
+import html
 import random
 from collections import Counter
 from pathlib import Path
 
 import anthropic
 import streamlit as st
+import streamlit.components.v1 as components
 
 import db
 from auth import require_login
@@ -14,15 +16,33 @@ from file_reader import extract_text
 from notes_maker import generate_notes
 from quiz_maker import generate_quiz, MODEL_CHEAP, MODEL_STRONG
 from quiz_ui import render_quiz, start_quiz, clear_quiz
+from study_guide import generate_guide, render_html, DETAIL_LEVELS
 
 MAX_MB = 10  # biggest file we accept
 PRICES = {MODEL_CHEAP: (0.10, 0.50), MODEL_STRONG: (2.00, 10.00)}  # per million tokens
 STYLE_LABELS = {"general": "General", "finance": "Finance", "physio": "Physiotherapy"}
 STYLE_BADGES = {"general": "blue", "finance": "violet", "physio": "green"}
+STYLE_ACCENTS = {"general": "#475569", "finance": "#2563EB", "physio": "#0F766E"}
 MODEL_CHOICES = {
     "Standard (Cheapest)": MODEL_CHEAP,
     "Stronger (About 20x the Price)": MODEL_STRONG,
 }
+# Module colours: (circle shown in menus, colour used on the page and in guides)
+MODULE_COLOURS = {
+    "blue": ("🔵", "#2563EB"),
+    "green": ("🟢", "#16A34A"),
+    "purple": ("🟣", "#7C3AED"),
+    "orange": ("🟠", "#EA580C"),
+    "red": ("🔴", "#DC2626"),
+    "yellow": ("🟡", "#CA8A04"),
+    "brown": ("🟤", "#92400E"),
+}
+GUIDE_DEFAULTS = {  # which extras are ticked by default for each course type
+    "general": dict(tables=True, charts=False, diagrams=True, examples=False, pearls=True, extras=False),
+    "finance": dict(tables=True, charts=True, diagrams=True, examples=True, pearls=True, extras=False),
+    "physio": dict(tables=True, charts=False, diagrams=False, examples=False, pearls=True, extras=False),
+}
+SORTS = ["Newest First", "Oldest First", "Name (A to Z)"]
 REVISION_SIZE = 10  # questions per revision round
 MAX_NAME_LENGTH = 60  # longest quiz name we accept
 
@@ -30,6 +50,7 @@ st.set_page_config(page_title="StudyBuddy", page_icon="📚")
 sb = require_login()  # the page stops here until someone is signed in
 
 
+# ---------- Small helpers ----------
 def cost_of(model, tokens_in, tokens_out):
     price_in, price_out = PRICES[model]
     return tokens_in * price_in / 1_000_000 + tokens_out * price_out / 1_000_000
@@ -42,6 +63,9 @@ def run_safely(action, *args):
         return True
     except ValueError as error:
         st.error(str(error))  # our own friendly messages
+    except anthropic.BadRequestError as error:
+        print("Claude rejected the request:", error)
+        st.error(f"Claude rejected the request: {error}")
     except anthropic.APIError as error:
         print("Claude API error:", error)
         st.error("Claude could not be reached right now. Please try again in a minute.")
@@ -54,18 +78,129 @@ def run_safely(action, *args):
     return False
 
 
+def act(action, *args, done=None):
+    """For button callbacks: run action(*args), then show a small pop-up message."""
+    try:
+        action(*args)
+        if done:
+            st.toast(done)
+    except ValueError as error:
+        st.toast(f"⚠️ {error}")
+    except Exception as error:
+        print("Action failed:", error)
+        if "JWT" in str(error):
+            st.toast("⚠️ Your login has expired. Please log out and log in again.")
+        else:
+            st.toast("⚠️ Something went wrong. Please try again.")
+
+
+def colour_info(name):
+    return MODULE_COLOURS.get(name, MODULE_COLOURS["blue"])
+
+
+def colour_label(name):
+    return f"{colour_info(name)[0]} {name.title()}"
+
+
+def next_free_colour(modules):
+    used = {m["colour"] for m in modules}
+    free = [c for c in MODULE_COLOURS if c not in used]
+    return free[0] if free else list(MODULE_COLOURS)[len(modules) % len(MODULE_COLOURS)]
+
+
+def sort_docs(items, how):
+    if how == "Oldest First":
+        return sorted(items, key=lambda d: d["created_at"])
+    if how == "Name (A to Z)":
+        return sorted(items, key=lambda d: d["filename"].lower())
+    return sorted(items, key=lambda d: d["created_at"], reverse=True)
+
+
+# ---------- Course, module and lecture actions (used by buttons) ----------
 def create_course(name, style):
     row = db.add_course(sb, name.strip(), style)
     st.session_state["course_id"] = row["id"]  # select the new course
 
 
-def add_lecture(course, uploaded):
+def do_rename_course(course_id):
+    db.rename_course(sb, course_id, st.session_state.get(f"rn_course_{course_id}", ""))
+
+
+def do_delete_course(course_id):
+    db.delete_course(sb, course_id)
+    for key in ("course_id", "loaded_doc", "active_doc", "active_course"):
+        st.session_state.pop(key, None)
+    clear_quiz()
+
+
+def do_add_module(course):
+    cid = course["id"]
+    name = st.session_state.get(f"new_mod_name_{cid}", "").strip()
+    if not name:
+        raise ValueError("Please type a module name.")
+    colour = st.session_state.get(f"new_mod_colour_{cid}", "blue")
+    modules = db.list_modules(sb, cid)
+    position = max([m["position"] for m in modules], default=-1) + 1
+    row = db.add_module(sb, cid, name, colour, position)
+    st.session_state[f"mod_{cid}"] = row["id"]  # jump to the new module
+    st.session_state[f"new_mod_name_{cid}"] = ""
+    st.session_state[f"new_mod_colour_{cid}"] = next_free_colour(modules + [row])
+
+
+def do_update_module(module_id):
+    name = st.session_state.get(f"rn_mod_{module_id}", "").strip()
+    if not name:
+        raise ValueError("Please type a module name.")
+    db.update_module(sb, module_id, {"name": name, "colour": st.session_state.get(f"col_mod_{module_id}", "blue")})
+
+
+def do_move_module(course_id, module_id, step):
+    modules = db.list_modules(sb, course_id)
+    ids = [m["id"] for m in modules]
+    i = ids.index(module_id)
+    j = i + step
+    if 0 <= j < len(modules):
+        db.swap_modules(sb, modules[i], modules[j])
+
+
+def do_delete_module(course_id, module_id):
+    db.delete_module(sb, module_id)
+    st.session_state[f"mod_{course_id}"] = "all"
+    st.session_state.pop(f"doc_{course_id}", None)
+    st.session_state.pop("loaded_doc", None)
+
+
+def do_rename_doc(doc_id):
+    name = st.session_state.get(f"rn_doc_{doc_id}", "").strip()
+    if not name:
+        raise ValueError("Please type a name.")
+    db.update_document(sb, doc_id, {"filename": name})
+    st.session_state.pop("loaded_doc", None)
+
+
+def do_move_doc(doc_id, course_id):
+    target = st.session_state.get(f"mv_doc_{doc_id}", "none")
+    db.update_document(sb, doc_id, {"module_id": None if target == "none" else target})
+    st.session_state.pop("loaded_doc", None)
+    st.session_state[f"mod_{course_id}"] = target  # follow the lecture to its new module
+    st.session_state[f"doc_{course_id}"] = doc_id
+
+
+def do_delete_doc(doc_id, course_id):
+    db.delete_document(sb, doc_id)
+    for key in ("loaded_doc", "active_doc"):
+        st.session_state.pop(key, None)
+    st.session_state.pop(f"doc_{course_id}", None)
+
+
+def add_lecture(course, uploaded, module_id):
     with st.spinner("Reading the file..."):
         text, pages = extract_text(uploaded, uploaded.name)
     if len(text.strip()) < 200:
         raise ValueError("I could not find much text. This file may be mostly images or a scan.")
-    row = db.save_document(sb, course["id"], uploaded.name, pages, text)
+    row = db.save_document(sb, course["id"], uploaded.name, pages, text, module_id)
     st.session_state[f"doc_{course['id']}"] = row["id"]  # select the new lecture
+    st.session_state[f"mod_{course['id']}"] = module_id or "all"  # show it
     st.session_state["uploader_n"] = st.session_state.get("uploader_n", 0) + 1  # empty the uploader
 
 
@@ -79,14 +214,69 @@ def load_doc(doc_id):
     return row
 
 
+# ---------- Notes, guides and quizzes ----------
 def make_notes(doc, model):
-    with st.spinner("Asking Claude for notes..."):
+    with st.spinner("Asking Claude for quick notes..."):
         notes, tokens_in, tokens_out = generate_notes(doc["lecture_text"], model=model)
     db.save_notes(sb, doc["id"], notes)
     doc["notes"] = notes
     st.session_state["notes_info"] = (
         f"{tokens_in} in | {tokens_out} out | about ${cost_of(model, tokens_in, tokens_out):.4f}"
     )
+
+
+def make_guide(course, doc, model, opts):
+    with st.spinner("Building your study guide. This can take a minute or two..."):
+        guide, tokens_in, tokens_out = generate_guide(
+            doc["lecture_text"], doc["filename"], course["style"], opts, model=model
+        )
+    db.save_guide(sb, doc["id"], guide)
+    doc["guide"] = guide
+    st.session_state["guide_info"] = (
+        f"{tokens_in} in | {tokens_out} out | about ${cost_of(model, tokens_in, tokens_out):.4f}"
+    )
+
+
+def render_guide_panel(course, doc, accent):
+    guide = doc.get("guide")
+    defaults = GUIDE_DEFAULTS[course["style"]]
+
+    if guide:
+        page = render_html(guide, accent)
+        st.download_button(
+            "⬇️ Download Study Guide", data=page, mime="text/html", type="primary",
+            file_name=f"{Path(doc['filename']).stem} - Study Guide.html",
+        )
+        st.caption("Open the file in any browser. For a PDF: open it, click Print / PDF, then choose Save as PDF.")
+        if st.session_state.get("guide_info"):
+            st.caption(st.session_state["guide_info"])
+        components.html(page, height=780, scrolling=True)
+
+    with st.expander("✨ Make a New Study Guide" if guide else "✨ Make a Study Guide", expanded=not guide):
+        st.caption("Claude writes the content and the app lays it out like a cheat sheet. "
+                   "A new guide replaces the old one. Cost on the standard model is usually a couple of cents (my estimate).")
+        with st.form(f"guide_form_{doc['id']}"):
+            c1, c2 = st.columns(2)
+            detail = c1.selectbox("Detail Level", list(DETAIL_LEVELS), index=1)
+            model_label = c2.selectbox(
+                "Claude Model", list(MODEL_CHOICES),
+                help="The stronger model costs about 20 times more. Best for hard material.",
+            )
+            st.markdown("**Include**")
+            k1, k2 = st.columns(2)
+            tables = k1.checkbox("Tables", value=defaults["tables"])
+            charts = k1.checkbox("Charts and Graphs", value=defaults["charts"])
+            diagrams = k1.checkbox("Flow Diagrams", value=defaults["diagrams"])
+            examples = k2.checkbox("Formulas and Worked Examples", value=defaults["examples"])
+            pearls = k2.checkbox("Exam Pearls", value=defaults["pearls"])
+            extras = k2.checkbox("Extra Topics Beyond the Slides (Marked Purple)", value=defaults["extras"])
+            submitted = st.form_submit_button("✨ Generate Study Guide", type="primary")
+
+        if submitted:
+            opts = {"detail": detail, "tables": tables, "charts": charts, "diagrams": diagrams,
+                    "examples": examples, "pearls": pearls, "extras": extras}
+            if run_safely(make_guide, course, doc, MODEL_CHOICES[model_label], opts):
+                st.rerun()
 
 
 def quiz_name(q, filename):
@@ -124,7 +314,6 @@ def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
     change = f"{latest - pcts[1]:+d}%" if len(pcts) > 1 else None
     due_now = sum(1 for m in lecture_missed if m["due_on"] <= today_iso)
 
-    # Row 1: the headline numbers
     with st.container(border=True):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Latest Score", f"{latest}%", delta=change)
@@ -133,7 +322,6 @@ def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
         c4.metric("Due Today", due_now)
         st.caption(f"Based on {len(pcts)} attempt(s) on this lecture.")
 
-    # Row 2: trend on the left, weak topics on the right
     left, right = st.columns(2)
     with left:
         with st.container(border=True):
@@ -155,7 +343,6 @@ def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
             else:
                 st.success("No weak topics. Nice work!")
 
-    # Row 3: a power bar for each recent attempt
     with st.container(border=True):
         st.markdown("**🕘 Recent Attempts**")
         for a, pct in list(zip(attempts, pcts))[:5]:
@@ -256,6 +443,84 @@ def save_result(course_id, quiz):
     db.record_results(sb, course_id, quiz, answers)
 
 
+# ---------- Manage panels ----------
+def render_manage(course, modules, module_by_id, selected):
+    """Rename and delete the course; add, edit, reorder and delete modules."""
+    cid = course["id"]
+    colour_keys = list(MODULE_COLOURS)
+    with st.expander("⚙️ Manage Course and Modules"):
+        st.markdown("**Rename Course**")
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        c1.text_input("Course Name", value=course["name"], key=f"rn_course_{cid}")
+        c2.button("Rename", key=f"rn_course_btn_{cid}", use_container_width=True, on_click=act,
+                  args=(do_rename_course, cid), kwargs={"done": "Course renamed."})
+
+        st.divider()
+        st.markdown("**Add a Module**")
+        st.caption("Modules are sections inside a course, for example Neurobiology 1. Each gets its own colour.")
+        a1, a2, a3 = st.columns([3, 2, 1], vertical_alignment="bottom")
+        a1.text_input("Module Name", key=f"new_mod_name_{cid}", placeholder="For example: Neurobiology 1")
+        a2.selectbox("Colour", colour_keys, index=colour_keys.index(next_free_colour(modules)),
+                     format_func=colour_label, key=f"new_mod_colour_{cid}")
+        a3.button("Add", key=f"add_mod_{cid}", use_container_width=True, on_click=act,
+                  args=(do_add_module, course), kwargs={"done": "Module added."})
+
+        if selected in module_by_id:
+            m = module_by_id[selected]
+            mid = m["id"]
+            index = [x["id"] for x in modules].index(mid)
+            st.divider()
+            st.markdown("**Edit the Selected Module**")
+            e1, e2, e3 = st.columns([3, 2, 1], vertical_alignment="bottom")
+            e1.text_input("Module Name", value=m["name"], key=f"rn_mod_{mid}")
+            e2.selectbox("Colour", colour_keys,
+                         index=colour_keys.index(m["colour"]) if m["colour"] in colour_keys else 0,
+                         format_func=colour_label, key=f"col_mod_{mid}")
+            e3.button("Save", key=f"save_mod_{mid}", use_container_width=True, on_click=act,
+                      args=(do_update_module, mid), kwargs={"done": "Module saved."})
+            b1, b2 = st.columns(2)
+            b1.button("◀ Move Left", key=f"left_{mid}", disabled=index == 0, use_container_width=True,
+                      on_click=act, args=(do_move_module, cid, mid, -1))
+            b2.button("Move Right ▶", key=f"right_{mid}", disabled=index == len(modules) - 1,
+                      use_container_width=True, on_click=act, args=(do_move_module, cid, mid, 1))
+            ok = st.checkbox("I understand: the lectures in this module move to Unsorted (they are not deleted).",
+                             key=f"cf_delmod_{mid}")
+            st.button("🗑️ Delete This Module", key=f"del_mod_{mid}", disabled=not ok, on_click=act,
+                      args=(do_delete_module, cid, mid), kwargs={"done": "Module deleted."})
+
+        st.divider()
+        st.markdown("**Danger Zone**")
+        ok = st.checkbox("I understand this permanently deletes this course and everything in it "
+                         "(modules, lectures, guides, quizzes and revision history).", key=f"cf_delcourse_{cid}")
+        st.button("🗑️ Delete This Course", key=f"del_course_{cid}", disabled=not ok, on_click=act,
+                  args=(do_delete_course, cid), kwargs={"done": "Course deleted."})
+
+
+def render_lecture_manage(course, doc, modules, module_by_id):
+    """Rename, move or delete the selected lecture."""
+    did = doc["id"]
+    with st.expander("⚙️ Manage This Lecture"):
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        c1.text_input("Lecture Name", value=doc["filename"], key=f"rn_doc_{did}")
+        c2.button("Rename", key=f"rn_doc_btn_{did}", use_container_width=True, on_click=act,
+                  args=(do_rename_doc, did), kwargs={"done": "Lecture renamed."})
+        if modules:
+            options = ["none"] + [m["id"] for m in modules]
+            current = doc.get("module_id") if doc.get("module_id") in module_by_id else "none"
+            m1, m2 = st.columns([3, 1], vertical_alignment="bottom")
+            m1.selectbox(
+                "Move to Module", options, index=options.index(current), key=f"mv_doc_{did}",
+                format_func=lambda v: "📂 Unsorted" if v == "none"
+                else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
+            )
+            m2.button("Move", key=f"mv_doc_btn_{did}", use_container_width=True, on_click=act,
+                      args=(do_move_doc, did, course["id"]), kwargs={"done": "Lecture moved."})
+        ok = st.checkbox("I understand this permanently deletes this lecture, its notes, study guide and quizzes.",
+                         key=f"cf_deldoc_{did}")
+        st.button("🗑️ Delete This Lecture", key=f"del_doc_{did}", disabled=not ok, on_click=act,
+                  args=(do_delete_doc, did, course["id"]), kwargs={"done": "Lecture deleted."})
+
+
 # ---------- Sidebar: courses ----------
 courses = db.list_courses(sb)
 
@@ -281,6 +546,8 @@ if not courses:
     st.stop()
 
 course = next(c for c in courses if c["id"] == st.session_state["course_id"])
+modules = db.list_modules(sb, course["id"])
+module_by_id = {m["id"]: m for m in modules}
 st.title(f"📚 {course['name']}")
 st.markdown(f":{STYLE_BADGES[course['style']]}-badge[{STYLE_LABELS[course['style']]} Course]")
 
@@ -306,35 +573,107 @@ if "quiz" in st.session_state:
     st.button("Close This Quiz", on_click=clear_quiz)
     st.stop()
 
-# ---------- Add a lecture ----------
 docs = db.list_documents(sb, course["id"])
+mod_key = f"mod_{course['id']}"
 
+# ---------- Add a lecture ----------
 with st.expander("⬆️ Add a Lecture", expanded=not docs):
     uploaded = st.file_uploader(
         "PDF or PowerPoint", type=["pdf", "pptx"],
         key=f"uploader_{st.session_state.get('uploader_n', 0)}",
     )
+    target_module = None
+    if modules:
+        ids = ["none"] + [m["id"] for m in modules]
+        last = st.session_state.get(mod_key, "all")
+        choice = st.selectbox(
+            "Add to Module", ids, index=ids.index(last if last in module_by_id else "none"),
+            format_func=lambda v: "📂 Unsorted" if v == "none"
+            else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
+        )
+        target_module = None if choice == "none" else choice
     if uploaded is not None:
         if uploaded.size > MAX_MB * 1024 * 1024:
             st.error(f"That file is over {MAX_MB} MB. Please choose a smaller one.")
         elif any(d["filename"] == uploaded.name for d in docs):
             st.warning("A lecture with this file name is already in this course.")
         elif st.button("Save Lecture to This Course", type="primary"):
-            if run_safely(add_lecture, course, uploaded):
+            if run_safely(add_lecture, course, uploaded, target_module):
                 st.rerun()
 
-if not docs:
-    st.info("No lectures in this course yet. Add one above.")
-    st.stop()
+# ---------- Module chips (the coloured sections) ----------
+unsorted_count = sum(1 for d in docs if d["module_id"] not in module_by_id)
+options = ["all"] + [m["id"] for m in modules] + (["none"] if modules and unsorted_count else [])
+
+
+def module_label(value):
+    if value == "all":
+        return f"📚 All Lectures ({len(docs)})"
+    if value == "none":
+        return f"📂 Unsorted ({unsorted_count})"
+    m = module_by_id[value]
+    count = sum(1 for d in docs if d["module_id"] == value)
+    return f"{colour_info(m['colour'])[0]} {m['name']} ({count})"
+
+
+if st.session_state.get(mod_key, "all") not in options:
+    st.session_state[mod_key] = "all"
+if modules:
+    selected = st.radio("Module", options, format_func=module_label, key=mod_key,
+                        horizontal=True, label_visibility="collapsed")
+else:
+    selected = "all"
+
+render_manage(course, modules, module_by_id, selected)
+
+if selected in module_by_id:
+    banner = module_by_id[selected]
+    hex_colour = colour_info(banner["colour"])[1]
+    st.markdown(
+        f'<div style="border-left:6px solid {hex_colour};background:{hex_colour}22;'
+        f'padding:8px 14px;border-radius:6px;font-weight:600">'
+        f'{colour_info(banner["colour"])[0]} {html.escape(banner["name"])}</div>',
+        unsafe_allow_html=True,
+    )
 
 # ---------- Pick a lecture ----------
-labels = {d["id"]: f"{d['filename']} · {db.short_date(d['created_at'])}" for d in docs}
-doc_id = st.selectbox("Lecture", list(labels), format_func=labels.get, key=f"doc_{course['id']}")
+if selected == "all":
+    shown = docs
+elif selected == "none":
+    shown = [d for d in docs if d["module_id"] not in module_by_id]
+else:
+    shown = [d for d in docs if d["module_id"] == selected]
+
+if not shown:
+    st.info("No lectures here yet. Add one above." if docs else "No lectures in this course yet. Add one above.")
+    st.stop()
+
+
+def doc_label(d):
+    m = module_by_id.get(d["module_id"])
+    tag = f"{colour_info(m['colour'])[0]} " if (m and selected == "all") else ""
+    return f"{tag}{d['filename']} · {db.short_date(d['created_at'])}"
+
+
+p1, p2 = st.columns([3, 1])
+sort_by = p2.selectbox("Sort", SORTS, key=f"sort_{course['id']}")
+ordered = sort_docs(shown, sort_by)
+labels = {d["id"]: doc_label(d) for d in ordered}
+doc_key = f"doc_{course['id']}"
+if st.session_state.get(doc_key) not in labels:
+    st.session_state.pop(doc_key, None)  # the chosen lecture is not in this module
+doc_id = p1.selectbox("Lecture", list(labels), format_func=labels.get, key=doc_key)
 doc = load_doc(doc_id)
 
 if st.session_state.get("active_doc") != doc_id:
     st.session_state.pop("notes_info", None)
+    st.session_state.pop("guide_info", None)
     st.session_state["active_doc"] = doc_id
+
+render_lecture_manage(course, doc, modules, module_by_id)
+
+lecture_module = module_by_id.get(doc.get("module_id"))
+accent = colour_info(lecture_module["colour"])[1] if lecture_module else STYLE_ACCENTS[course["style"]]
 
 # ---------- Data shared by the tabs (fetched once per click) ----------
 saved = db.list_quizzes(sb, doc_id)
@@ -348,14 +687,20 @@ tab_notes, tab_quiz, tab_revise = st.tabs(["📝 Notes", "❓ Quiz", "🔁 Revis
 
 # ---------- Notes ----------
 with tab_notes:
-    if doc["notes"]:
+    mode = st.radio("Notes Type", ["📘 Study Guide", "⚡ Quick Notes"], horizontal=True,
+                    label_visibility="collapsed", key=f"notes_mode_{doc_id}")
+    if mode.startswith("📘"):
+        render_guide_panel(course, doc, accent)
+    elif doc["notes"]:
         render_notes(doc["notes"])
         if st.session_state.get("notes_info"):
             st.caption(st.session_state["notes_info"])
         st.caption("These notes are a first draft. Check numbers against your original slides.")
-    elif st.button("📝 Make Study Notes", type="primary"):
-        if run_safely(make_notes, doc, MODEL_CHEAP):
-            st.rerun()
+    else:
+        st.caption("Short in-app notes for a quick glance. For a full downloadable guide, use Study Guide.")
+        if st.button("⚡ Make Quick Notes", type="primary"):
+            if run_safely(make_notes, doc, MODEL_CHEAP):
+                st.rerun()
 
 # ---------- Quiz ----------
 with tab_quiz:
@@ -391,7 +736,7 @@ with tab_quiz:
 
     # The dashboard: this lecture's attempts (newest first) and its open mistakes
     st.divider()
-    attempts = [a for a in db.recent_attempts(sb) if a["quiz_id"] in by_id]
+    attempts = [a for a in db.recent_attempts(sb) if a["quiz_id"] in by_id][:50]
     lecture_keys = {db.question_key(q["question"]) for row in saved for q in row["questions"]}
     lecture_missed = [m for m in missed if m["question_key"] in lecture_keys]
     render_dashboard(attempts, by_id, doc["filename"], lecture_missed, today)
@@ -399,6 +744,7 @@ with tab_quiz:
 # ---------- Revise & Practise (whole course) ----------
 with tab_revise:
     st.subheader("🔁 Spaced Revision")
+    st.caption("This covers every lecture in the course.")
     count_due, count_later = st.columns(2)
     count_due.metric("Due Today", len(due))
     count_later.metric("Scheduled Later", len(missed) - len(due))

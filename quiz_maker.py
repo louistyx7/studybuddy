@@ -8,11 +8,16 @@ Created on Mon Nov  9 13:30:50 2026
 
 import random
 
+from claude_call import call_with_tool
 from notes_maker import client, MODEL_CHEAP, MAX_CHARS
 from pdf_reader import extract_pdf_text
 
 # The stronger (and pricier) model, for hard material
 MODEL_STRONG = "claude-sonnet-5-5"
+
+# A ceiling, not a cost. Thinking tokens count towards it, and calculation-heavy
+# lectures can think a lot, so it needs plenty of room.
+QUIZ_MAX_TOKENS = 24000
 
 QUIZ_INSTRUCTIONS = """You are a university quiz writer.
 Write multiple-choice questions from the lecture text you are given,
@@ -111,20 +116,20 @@ def generate_quiz(lecture_text, n_questions=8, style_hint="", model=MODEL_CHEAP)
 
     # Try up to 2 times, in case the form comes back faulty
     for attempt in range(2):
-        response = client.messages.create(
+        response = call_with_tool(
+            client,
             model=model,
-            max_tokens=8000,
             system=instructions,
-            tools=[QUIZ_TOOL],
-            messages=[
-                {"role": "user", "content": "Here is the lecture text:\n\n" + lecture_text}
-            ],
+            user_text="Here is the lecture text:\n\n" + lecture_text,
+            tool=QUIZ_TOOL,
+            max_tokens=QUIZ_MAX_TOKENS,
         )
         total_in += response.usage.input_tokens
         total_out += response.usage.output_tokens
 
         if response.stop_reason == "max_tokens":
-            raise ValueError("The quiz was cut off because it hit the length limit. Try a shorter file.")
+            raise ValueError("The quiz was cut off because it hit the length limit. "
+                             "Try fewer questions or a shorter file.")
 
         for block in response.content:
             if block.type == "tool_use" and block.name == "save_quiz":

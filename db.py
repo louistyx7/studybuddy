@@ -44,6 +44,13 @@ def short_time(text):
         return ""
 
 
+def _deleted(result, what):
+    """A delete that removed nothing means it was blocked, so say so."""
+    if not result.data:
+        raise ValueError(f"Could not delete the {what}. Nothing was removed.")
+
+
+# ---------- Courses ----------
 def list_courses(sb):
     return sb.table("courses").select("*").order("created_at").execute().data
 
@@ -52,10 +59,50 @@ def add_course(sb, name, style):
     return sb.table("courses").insert({"name": name, "style": style}).execute().data[0]
 
 
+def rename_course(sb, course_id, name):
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Please type a name.")
+    sb.table("courses").update({"name": name}).eq("id", course_id).execute()
+
+
+def delete_course(sb, course_id):
+    _deleted(sb.table("courses").delete().eq("id", course_id).execute(), "course")
+
+
+# ---------- Modules ----------
+def list_modules(sb, course_id):
+    return (
+        sb.table("modules").select("*").eq("course_id", course_id)
+        .order("position").order("created_at").execute().data
+    )
+
+
+def add_module(sb, course_id, name, colour, position):
+    row = {"course_id": course_id, "name": name.strip(), "colour": colour, "position": position}
+    return sb.table("modules").insert(row).execute().data[0]
+
+
+def update_module(sb, module_id, changes):
+    sb.table("modules").update(changes).eq("id", module_id).execute()
+
+
+def delete_module(sb, module_id):
+    # Lectures inside are kept: the database sets their module to empty (Unsorted).
+    _deleted(sb.table("modules").delete().eq("id", module_id).execute(), "module")
+
+
+def swap_modules(sb, a, b):
+    """Swap the order positions of two modules."""
+    sb.table("modules").update({"position": b["position"]}).eq("id", a["id"]).execute()
+    sb.table("modules").update({"position": a["position"]}).eq("id", b["id"]).execute()
+
+
+# ---------- Lectures ----------
 def list_documents(sb, course_id):
     return (
         sb.table("documents")
-        .select("id, filename, pages, created_at")
+        .select("id, filename, pages, created_at, module_id")
         .eq("course_id", course_id)
         .order("created_at", desc=True)
         .execute()
@@ -67,15 +114,30 @@ def get_document(sb, doc_id):
     return sb.table("documents").select("*").eq("id", doc_id).execute().data[0]
 
 
-def save_document(sb, course_id, filename, pages, text):
+def save_document(sb, course_id, filename, pages, text, module_id=None):
     row = {"course_id": course_id, "filename": filename, "pages": pages, "lecture_text": text}
+    if module_id:
+        row["module_id"] = module_id
     return sb.table("documents").insert(row).execute().data[0]
+
+
+def update_document(sb, doc_id, changes):
+    sb.table("documents").update(changes).eq("id", doc_id).execute()
+
+
+def delete_document(sb, doc_id):
+    _deleted(sb.table("documents").delete().eq("id", doc_id).execute(), "lecture")
 
 
 def save_notes(sb, doc_id, notes):
     sb.table("documents").update({"notes": notes}).eq("id", doc_id).execute()
 
 
+def save_guide(sb, doc_id, guide):
+    sb.table("documents").update({"guide": guide}).eq("id", doc_id).execute()
+
+
+# ---------- Quizzes ----------
 def list_quizzes(sb, doc_id):
     return (
         sb.table("quizzes")
@@ -108,6 +170,7 @@ def recent_attempts(sb):
     )
 
 
+# ---------- Revision ----------
 def question_key(text):
     """A short fingerprint of a question, so the same question is recognised next time."""
     return hashlib.md5(text.strip().lower().encode("utf-8")).hexdigest()
