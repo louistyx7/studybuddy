@@ -3,6 +3,7 @@ from collections import Counter
 import streamlit as st
 
 from display import safe
+from ui import quiz_css
 
 
 def start_quiz():
@@ -26,7 +27,7 @@ def _choose(question_number, option_number):
 
 
 def _next():
-    """Runs when 'Next Question' is clicked: move on one question."""
+    """Runs when 'Next' is clicked: move on one question."""
     st.session_state["quiz_index"] += 1
 
 
@@ -53,10 +54,16 @@ def render_quiz(questions, on_flag=None):
     q = questions[index]
     answered = index in answers
 
+    # Animations for this question's buttons (right answer pops, wrong pick shakes)
+    st.markdown(
+        quiz_css(index, q["correct_index"] if answered else None, answers.get(index)),
+        unsafe_allow_html=True,
+    )
+
     st.progress(index / total, text=f"Question {index + 1} of {total}")
 
-    # The question sits in a card
-    with st.container(border=True):
+    # The question sits in a card (the key makes it slide in again for each question)
+    with st.container(border=True, key=f"qcard{index}"):
         st.caption("Topic: " + safe(q["topic"]))
         st.markdown("**" + safe(q["question"]) + "**")
 
@@ -85,16 +92,18 @@ def render_quiz(questions, on_flag=None):
             st.error("Not quite.")
         st.info(safe(q["explanation"]))
 
-        if on_flag is not None:
-            flagged = st.session_state.setdefault("flagged_qs", set())
-            if index in flagged:
-                st.caption("🚩 Reported. It won't come back in revision or mixed practice.")
-            else:
-                st.button("🚩 Report This Question", key=f"flag{index}",
-                          on_click=_flag, args=(index, q, on_flag))
-
-        next_label = "Next Question" if index + 1 < total else "Finish Quiz"
-        st.button(next_label, on_click=_next, type="primary")
+        left, right = st.columns([1, 1], vertical_alignment="center")
+        with left:
+            if on_flag is not None:
+                flagged = st.session_state.setdefault("flagged_qs", set())
+                if index in flagged:
+                    st.caption("🚩 Reported. It won't come back.")
+                else:
+                    st.button("🚩 Report", key=f"flag{index}", on_click=_flag, args=(index, q, on_flag),
+                              help="Mark this question as wrong or unclear. It won't come back in revision or mixed practice.")
+        with right:
+            next_label = "Next ➜" if index + 1 < total else "Finish 🏁"
+            st.button(next_label, on_click=_next, type="primary", use_container_width=True, key=f"next{index}")
 
 
 def render_results(questions):
@@ -120,7 +129,11 @@ def render_results(questions):
     score = total - len(wrong)
     percent = round(100 * score / total)
 
-    st.header(f"Your Score: {score} / {total}  ({percent}%)")
+    st.markdown(
+        f'<div class="sb-score"><span class="sb-score-num">{score}</span>'
+        f'<span class="sb-score-of">/ {total}</span><span class="sb-score-pct">{percent}%</span></div>',
+        unsafe_allow_html=True,
+    )
     st.progress(score / total)
 
     if percent == 100:
@@ -147,6 +160,6 @@ def render_results(questions):
 
     col1, col2 = st.columns(2)
     with col1:
-        st.button("Retake This Quiz", on_click=start_quiz, use_container_width=True)
+        st.button("🔄 Retake This Quiz", on_click=start_quiz, use_container_width=True)
     with col2:
-        st.button("Make a New Quiz", on_click=clear_quiz, use_container_width=True)
+        st.button("⬅️ Back to Lecture", on_click=clear_quiz, use_container_width=True, type="primary")

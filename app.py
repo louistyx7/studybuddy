@@ -17,11 +17,11 @@ from notes_maker import generate_notes
 from quiz_maker import generate_quiz, MODEL_CHEAP, MODEL_STRONG
 from quiz_ui import render_quiz, start_quiz, clear_quiz
 from study_guide import generate_guide, render_html, DETAIL_LEVELS
+from ui import inject_css, hero
 
 MAX_MB = 10  # biggest file we accept
 PRICES = {MODEL_CHEAP: (0.10, 0.50), MODEL_STRONG: (2.00, 10.00)}  # per million tokens
 STYLE_LABELS = {"general": "General", "finance": "Finance", "physio": "Physiotherapy"}
-STYLE_BADGES = {"general": "blue", "finance": "violet", "physio": "green"}
 STYLE_ACCENTS = {"general": "#475569", "finance": "#2563EB", "physio": "#0F766E"}
 MODEL_CHOICES = {
     "Standard (Cheapest)": MODEL_CHEAP,
@@ -37,16 +37,22 @@ MODULE_COLOURS = {
     "yellow": ("🟡", "#CA8A04"),
     "brown": ("🟤", "#92400E"),
 }
-GUIDE_DEFAULTS = {  # which extras are ticked by default for each course type
+GUIDE_DEFAULTS = {  # which extras are on by default for each course type
     "general": dict(tables=True, charts=False, diagrams=True, examples=False, pearls=True, extras=False),
     "finance": dict(tables=True, charts=True, diagrams=True, examples=True, pearls=True, extras=False),
     "physio": dict(tables=True, charts=False, diagrams=False, examples=False, pearls=True, extras=False),
+}
+GUIDE_LABELS = {
+    "tables": "Tables", "charts": "Charts and Graphs", "diagrams": "Flow Diagrams",
+    "examples": "Formulas and Worked Examples", "pearls": "Exam Pearls",
+    "extras": "Extra Topics Beyond the Slides",
 }
 SORTS = ["Newest First", "Oldest First", "Name (A to Z)"]
 REVISION_SIZE = 10  # questions per revision round
 MAX_NAME_LENGTH = 60  # longest quiz name we accept
 
 st.set_page_config(page_title="StudyBuddy", page_icon="📚")
+inject_css()
 sb = require_login()  # the page stops here until someone is signed in
 
 
@@ -132,6 +138,10 @@ def doc_label(d, module_by_id, selected):
     return f"{tag}{d['filename']}"
 
 
+def remember_sort():
+    st.session_state["sort_pref"] = st.session_state.get("sort_widget", SORTS[0])
+
+
 # ---------- Actions (all run from buttons) ----------
 def do_create_course():
     name = st.session_state.get("new_course_name", "").strip()
@@ -214,15 +224,19 @@ def do_delete_doc(doc_id, course_id):
 
 
 def add_lecture(course, uploaded, module_id, has_modules):
-    with st.spinner("Reading the file..."):
+    with st.status("Adding your lecture...", expanded=True) as status:
+        st.write("📖 Reading the file")
         text, pages = extract_text(uploaded, uploaded.name)
-    if len(text.strip()) < 200:
-        raise ValueError("I could not find much text. This file may be mostly images or a scan.")
-    row = db.save_document(sb, course["id"], uploaded.name, pages, text, module_id)
+        if len(text.strip()) < 200:
+            raise ValueError("I could not find much text. This file may be mostly images or a scan.")
+        st.write("💾 Saving it to your course")
+        row = db.save_document(sb, course["id"], uploaded.name, pages, text, module_id)
+        status.update(label="Lecture added", state="complete", expanded=False)
     # The sidebar is already drawn, so ask for the new lecture to be selected on the next run
     show_in = module_id if module_id else ("none" if has_modules else "all")
     st.session_state["_goto"] = (course["id"], show_in, row["id"])
     st.session_state["uploader_n"] = st.session_state.get("uploader_n", 0) + 1  # empty the uploader
+    st.toast("Lecture added! 📚")
 
 
 def load_doc(doc_id):
@@ -235,140 +249,173 @@ def load_doc(doc_id):
     return row
 
 
-# ---------- Sidebar tools ----------
-def sidebar_course_tools(course):
+# ---------- The Manage panel (sidebar). Only the chosen area shows. ----------
+def manage_new_course():
+    st.text_input("Course Name", key="new_course_name")
+    st.selectbox("Course Type", list(STYLE_LABELS), format_func=STYLE_LABELS.get, key="new_course_style")
+    st.button("Create Course", use_container_width=True, type="primary", on_click=act,
+              args=(do_create_course,), kwargs={"done": "Course created."})
+
+
+def manage_course(course):
     cid = course["id"]
-    with st.expander("✏️ Edit Course"):
-        st.text_input("Course Name", value=course["name"], key=f"rn_course_{cid}")
-        st.button("Rename Course", key=f"rn_course_btn_{cid}", use_container_width=True, on_click=act,
-                  args=(do_rename_course, cid), kwargs={"done": "Course renamed."})
-        st.divider()
-        ok = st.checkbox("Yes, permanently delete this course and everything in it.", key=f"cf_delcourse_{cid}")
-        st.caption("This deletes its modules, lectures, guides, quizzes and revision history.")
-        st.button("🗑️ Delete Course", key=f"del_course_{cid}", disabled=not ok, use_container_width=True,
-                  on_click=act, args=(do_delete_course, cid), kwargs={"done": "Course deleted."})
+    st.text_input("Course Name", value=course["name"], key=f"rn_course_{cid}")
+    st.button("Rename Course", key=f"rn_course_btn_{cid}", use_container_width=True, on_click=act,
+              args=(do_rename_course, cid), kwargs={"done": "Course renamed."})
+    st.divider()
+    ok = st.checkbox("Yes, permanently delete this course and everything in it.", key=f"cf_delcourse_{cid}")
+    st.caption("This deletes its modules, lectures, guides, quizzes and revision history.")
+    st.button("🗑️ Delete Course", key=f"del_course_{cid}", disabled=not ok, use_container_width=True,
+              on_click=act, args=(do_delete_course, cid), kwargs={"done": "Course deleted."})
 
 
-def sidebar_module_tools(course, modules, module_by_id, selected):
+def manage_modules(course, modules, selected, module_by_id):
     cid = course["id"]
     colour_keys = list(MODULE_COLOURS)
-    with st.expander("➕ Add Module"):
-        st.caption("A module is a section inside a course, for example Neurobiology 1. Each gets its own colour.")
-        st.text_input("Module Name", key=f"new_mod_name_{cid}", placeholder="For example: Neurobiology 1")
-        st.selectbox("Colour", colour_keys, index=colour_keys.index(next_free_colour(modules)),
-                     format_func=colour_label, key=f"new_mod_colour_{cid}")
-        st.button("Add Module", key=f"add_mod_{cid}", use_container_width=True, on_click=act,
-                  args=(do_add_module, course), kwargs={"done": "Module added."})
+    st.markdown("**Add a Module**")
+    st.caption("A module is a section inside a course, for example Neurobiology 1. Each gets its own colour.")
+    st.text_input("Module Name", key=f"new_mod_name_{cid}", placeholder="For example: Neurobiology 1")
+    st.selectbox("Colour", colour_keys, index=colour_keys.index(next_free_colour(modules)),
+                 format_func=colour_label, key=f"new_mod_colour_{cid}")
+    st.button("Add Module", key=f"add_mod_{cid}", use_container_width=True, type="primary", on_click=act,
+              args=(do_add_module, course), kwargs={"done": "Module added."})
 
     if selected in module_by_id:
         m = module_by_id[selected]
         mid = m["id"]
         index = [x["id"] for x in modules].index(mid)
-        with st.expander("✏️ Edit This Module"):
-            st.text_input("Module Name", value=m["name"], key=f"rn_mod_{mid}")
-            st.selectbox("Colour", colour_keys,
-                         index=colour_keys.index(m["colour"]) if m["colour"] in colour_keys else 0,
-                         format_func=colour_label, key=f"col_mod_{mid}")
-            st.button("Save Changes", key=f"save_mod_{mid}", use_container_width=True, on_click=act,
-                      args=(do_update_module, mid), kwargs={"done": "Module saved."})
-            u1, u2 = st.columns(2)
-            u1.button("▲ Up", key=f"up_{mid}", disabled=index == 0, use_container_width=True,
-                      on_click=act, args=(do_move_module, cid, mid, -1))
-            u2.button("▼ Down", key=f"down_{mid}", disabled=index == len(modules) - 1,
-                      use_container_width=True, on_click=act, args=(do_move_module, cid, mid, 1))
-            st.divider()
-            ok = st.checkbox("Yes, delete this module.", key=f"cf_delmod_{mid}")
-            st.caption("Its lectures are kept and move to Unsorted.")
-            st.button("🗑️ Delete Module", key=f"del_mod_{mid}", disabled=not ok, use_container_width=True,
-                      on_click=act, args=(do_delete_module, cid, mid), kwargs={"done": "Module deleted."})
-
-
-def sidebar_lecture_tools(course, doc_row, modules, module_by_id):
-    did = doc_row["id"]
-    with st.expander("✏️ Edit This Lecture"):
-        st.text_input("Lecture Name", value=doc_row["filename"], key=f"rn_doc_{did}")
-        st.button("Rename Lecture", key=f"rn_doc_btn_{did}", use_container_width=True, on_click=act,
-                  args=(do_rename_doc, did), kwargs={"done": "Lecture renamed."})
-        if modules:
-            options = ["none"] + [m["id"] for m in modules]
-            current = doc_row.get("module_id") if doc_row.get("module_id") in module_by_id else "none"
-            st.selectbox(
-                "Move to Module", options, index=options.index(current), key=f"mv_doc_{did}",
-                format_func=lambda v: "📂 Unsorted" if v == "none"
-                else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
-            )
-            st.button("Move Lecture", key=f"mv_doc_btn_{did}", use_container_width=True, on_click=act,
-                      args=(do_move_doc, did, course["id"]), kwargs={"done": "Lecture moved."})
         st.divider()
-        ok = st.checkbox("Yes, permanently delete this lecture.", key=f"cf_deldoc_{did}")
-        st.caption("This deletes its notes, study guide and quizzes.")
-        st.button("🗑️ Delete Lecture", key=f"del_doc_{did}", disabled=not ok, use_container_width=True,
-                  on_click=act, args=(do_delete_doc, did, course["id"]), kwargs={"done": "Lecture deleted."})
+        st.markdown(f"**Edit {html.escape(m['name'])}**")
+        st.text_input("Module Name", value=m["name"], key=f"rn_mod_{mid}")
+        st.selectbox("Colour", colour_keys,
+                     index=colour_keys.index(m["colour"]) if m["colour"] in colour_keys else 0,
+                     format_func=colour_label, key=f"col_mod_{mid}")
+        st.button("Save Changes", key=f"save_mod_{mid}", use_container_width=True, on_click=act,
+                  args=(do_update_module, mid), kwargs={"done": "Module saved."})
+        u1, u2 = st.columns(2)
+        u1.button("▲ Up", key=f"up_{mid}", disabled=index == 0, use_container_width=True,
+                  on_click=act, args=(do_move_module, cid, mid, -1))
+        u2.button("▼ Down", key=f"down_{mid}", disabled=index == len(modules) - 1,
+                  use_container_width=True, on_click=act, args=(do_move_module, cid, mid, 1))
+        ok = st.checkbox("Yes, delete this module.", key=f"cf_delmod_{mid}")
+        st.caption("Its lectures are kept and move to Unsorted.")
+        st.button("🗑️ Delete Module", key=f"del_mod_{mid}", disabled=not ok, use_container_width=True,
+                  on_click=act, args=(do_delete_module, cid, mid), kwargs={"done": "Module deleted."})
+    elif modules:
+        st.caption("Pick a module in the list above to rename, recolour, reorder or delete it.")
+
+
+def manage_lecture(course, doc_row, modules, module_by_id):
+    st.selectbox("Sort Lectures By", SORTS, key="sort_widget", on_change=remember_sort,
+                 index=SORTS.index(st.session_state.get("sort_pref", SORTS[0])))
+    if doc_row is None:
+        st.caption("Pick a lecture in the list above to rename, move or delete it.")
+        return
+    did = doc_row["id"]
+    st.divider()
+    st.markdown(f"**Edit {html.escape(doc_row['filename'])}**")
+    st.text_input("Lecture Name", value=doc_row["filename"], key=f"rn_doc_{did}")
+    st.button("Rename Lecture", key=f"rn_doc_btn_{did}", use_container_width=True, on_click=act,
+              args=(do_rename_doc, did), kwargs={"done": "Lecture renamed."})
+    if modules:
+        options = ["none"] + [m["id"] for m in modules]
+        current = doc_row.get("module_id") if doc_row.get("module_id") in module_by_id else "none"
+        st.selectbox(
+            "Move to Module", options, index=options.index(current), key=f"mv_doc_{did}",
+            format_func=lambda v: "📂 Unsorted" if v == "none"
+            else f"{colour_info(module_by_id[v]['colour'])[0]} {module_by_id[v]['name']}",
+        )
+        st.button("Move Lecture", key=f"mv_doc_btn_{did}", use_container_width=True, on_click=act,
+                  args=(do_move_doc, did, course["id"]), kwargs={"done": "Lecture moved."})
+    ok = st.checkbox("Yes, permanently delete this lecture.", key=f"cf_deldoc_{did}")
+    st.caption("This deletes its notes, study guide and quizzes.")
+    st.button("🗑️ Delete Lecture", key=f"del_doc_{did}", disabled=not ok, use_container_width=True,
+              on_click=act, args=(do_delete_doc, did, course["id"]), kwargs={"done": "Lecture deleted."})
 
 
 # ---------- Notes, guides and quizzes ----------
 def make_notes(doc, model):
-    with st.spinner("Asking Claude for quick notes..."):
+    with st.status("Writing your quick notes...", expanded=True) as status:
+        st.write("📖 Reading the lecture")
         notes, tokens_in, tokens_out = generate_notes(doc["lecture_text"], model=model)
-    db.save_notes(sb, doc["id"], notes)
+        st.write("💾 Saving")
+        db.save_notes(sb, doc["id"], notes)
+        status.update(label="Quick notes ready", state="complete", expanded=False)
     doc["notes"] = notes
     st.session_state["notes_info"] = (
         f"{tokens_in} in | {tokens_out} out | about ${cost_of(model, tokens_in, tokens_out):.4f}"
     )
+    st.toast("Quick notes ready! ⚡")
 
 
 def make_guide(course, doc, model, opts):
-    with st.spinner("Building your study guide. This can take a minute or two..."):
+    with st.status("Building your study guide...", expanded=True) as status:
+        st.write("📖 Reading the lecture")
+        st.write("🧠 Claude is writing (this can take a minute or two)")
         guide, tokens_in, tokens_out = generate_guide(
             doc["lecture_text"], doc["filename"], course["style"], opts, model=model
         )
-    db.save_guide(sb, doc["id"], guide)
+        st.write("🎨 Laying it out")
+        db.save_guide(sb, doc["id"], guide)
+        status.update(label="Study guide ready", state="complete", expanded=False)
     doc["guide"] = guide
     st.session_state["guide_info"] = (
         f"{tokens_in} in | {tokens_out} out | about ${cost_of(model, tokens_in, tokens_out):.4f}"
     )
+    st.toast("Study guide ready! 📘")
+
+
+def guide_maker(course, doc):
+    """The study-guide form. One click uses the defaults; the toggle lets you choose what to include."""
+    defaults = GUIDE_DEFAULTS[course["style"]]
+    custom = st.toggle("Choose What to Include", key=f"guide_custom_{doc['id']}")
+    if not custom:
+        on = [GUIDE_LABELS[k] for k, v in defaults.items() if v]
+        st.caption("Includes: " + ", ".join(on) + ".")
+    with st.form(f"guide_form_{doc['id']}"):
+        c1, c2 = st.columns(2)
+        detail = c1.selectbox("Detail Level", list(DETAIL_LEVELS), index=1)
+        model_label = c2.selectbox(
+            "Claude Model", list(MODEL_CHOICES),
+            help="The stronger model costs about 20 times more. Best for hard material.",
+        )
+        picks = dict(defaults)
+        if custom:
+            k1, k2 = st.columns(2)
+            picks["tables"] = k1.checkbox(GUIDE_LABELS["tables"], value=defaults["tables"])
+            picks["charts"] = k1.checkbox(GUIDE_LABELS["charts"], value=defaults["charts"])
+            picks["diagrams"] = k1.checkbox(GUIDE_LABELS["diagrams"], value=defaults["diagrams"])
+            picks["examples"] = k2.checkbox(GUIDE_LABELS["examples"], value=defaults["examples"])
+            picks["pearls"] = k2.checkbox(GUIDE_LABELS["pearls"], value=defaults["pearls"])
+            picks["extras"] = k2.checkbox(GUIDE_LABELS["extras"] + " (Marked Purple)", value=defaults["extras"])
+        submitted = st.form_submit_button("✨ Generate Study Guide", type="primary", use_container_width=True)
+
+    if submitted:
+        opts = {"detail": detail, **picks}
+        if run_safely(make_guide, course, doc, MODEL_CHOICES[model_label], opts):
+            st.rerun()
 
 
 def render_guide_panel(course, doc, accent):
     guide = doc.get("guide")
-    defaults = GUIDE_DEFAULTS[course["style"]]
-
     if guide:
         page = render_html(guide, accent)
         st.download_button(
             "⬇️ Download Study Guide", data=page, mime="text/html", type="primary",
             file_name=f"{Path(doc['filename']).stem} - Study Guide.html",
+            help="Open the file in any browser. For a PDF: open it, click Print / PDF, then Save as PDF.",
         )
-        st.caption("Open the file in any browser. For a PDF: open it, click Print / PDF, then choose Save as PDF.")
         if st.session_state.get("guide_info"):
             st.caption(st.session_state["guide_info"])
         components.html(page, height=780, scrolling=True)
-
-    with st.expander("✨ Make a New Study Guide" if guide else "✨ Make a Study Guide", expanded=not guide):
-        st.caption("Claude writes the content and the app lays it out like a cheat sheet. "
-                   "A new guide replaces the old one. Cost on the standard model is usually a couple of cents (my estimate).")
-        with st.form(f"guide_form_{doc['id']}"):
-            c1, c2 = st.columns(2)
-            detail = c1.selectbox("Detail Level", list(DETAIL_LEVELS), index=1)
-            model_label = c2.selectbox(
-                "Claude Model", list(MODEL_CHOICES),
-                help="The stronger model costs about 20 times more. Best for hard material.",
-            )
-            st.markdown("**Include**")
-            k1, k2 = st.columns(2)
-            tables = k1.checkbox("Tables", value=defaults["tables"])
-            charts = k1.checkbox("Charts and Graphs", value=defaults["charts"])
-            diagrams = k1.checkbox("Flow Diagrams", value=defaults["diagrams"])
-            examples = k2.checkbox("Formulas and Worked Examples", value=defaults["examples"])
-            pearls = k2.checkbox("Exam Pearls", value=defaults["pearls"])
-            extras = k2.checkbox("Extra Topics Beyond the Slides (Marked Purple)", value=defaults["extras"])
-            submitted = st.form_submit_button("✨ Generate Study Guide", type="primary")
-
-        if submitted:
-            opts = {"detail": detail, "tables": tables, "charts": charts, "diagrams": diagrams,
-                    "examples": examples, "pearls": pearls, "extras": extras}
-            if run_safely(make_guide, course, doc, MODEL_CHOICES[model_label], opts):
-                st.rerun()
+        with st.expander("🔄 Make a New Study Guide"):
+            st.caption("A new guide replaces the old one.")
+            guide_maker(course, doc)
+    else:
+        st.markdown("#### ✨ Make a Study Guide")
+        st.caption("A cheat sheet you can download and open anywhere. Usually a couple of cents on the "
+                   "standard model (my estimate).")
+        guide_maker(course, doc)
 
 
 def quiz_name(q, filename):
@@ -396,7 +443,7 @@ def percent(score, total):
 
 def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
     """The progress dashboard for one lecture. attempts is newest first."""
-    st.subheader("📊 Progress Dashboard")
+    st.subheader("📊 Progress")
     if not attempts:
         st.info("Finish a quiz and your scores, trend and weak topics will appear here.")
         return
@@ -406,13 +453,11 @@ def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
     change = f"{latest - pcts[1]:+d}%" if len(pcts) > 1 else None
     due_now = sum(1 for m in lecture_missed if m["due_on"] <= today_iso)
 
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Latest Score", f"{latest}%", delta=change)
-        c2.metric("Average", f"{round(sum(pcts) / len(pcts))}%")
-        c3.metric("Best", f"{max(pcts)}%")
-        c4.metric("Due Today", due_now)
-        st.caption(f"Based on {len(pcts)} attempt(s) on this lecture.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Latest", f"{latest}%", delta=change)
+    c2.metric("Average", f"{round(sum(pcts) / len(pcts))}%")
+    c3.metric("Best", f"{max(pcts)}%")
+    c4.metric("Due Today", due_now)
 
     left, right = st.columns(2)
     with left:
@@ -431,7 +476,6 @@ def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
                 biggest = top[0][1]
                 for topic, number in top:
                     st.progress(number / biggest, text=f"{safe(topic)} · {number} to revise")
-                st.caption("Re-read your notes on these topics, then use Revise & Practise.")
             else:
                 st.success("No weak topics. Nice work!")
 
@@ -445,19 +489,22 @@ def render_dashboard(attempts, by_id, filename, lecture_missed, today_iso):
                 text=f"{dot} {safe(name)} · {db.short_date(a['created_at'])} · "
                      f"{a['score']} / {a['total']} ({pct}%)",
             )
-        st.caption("🟢 70% and above · 🟡 50 to 69% · 🔴 Below 50%")
 
 
 def make_quiz(course, doc, model, n_questions, name):
     name = (name or "").strip()[:MAX_NAME_LENGTH] or Path(doc["filename"]).stem
-    with st.spinner("Asking Claude for a quiz..."):
+    with st.status("Writing your quiz...", expanded=True) as status:
+        st.write("📖 Reading the lecture")
+        st.write("🧠 Claude is writing the questions")
         questions, tokens_in, tokens_out = generate_quiz(
             doc["lecture_text"],
             n_questions=n_questions,
             style_hint=STYLE_HINTS[course["style"]],
             model=model,
         )
-    row = db.save_quiz(sb, doc["id"], model, questions, name)
+        st.write("💾 Saving")
+        row = db.save_quiz(sb, doc["id"], model, questions, name)
+        status.update(label="Quiz ready", state="complete", expanded=False)
     clear_quiz()
     st.session_state["quiz"] = questions
     st.session_state["quiz_id"] = row["id"]
@@ -470,7 +517,7 @@ def make_quiz(course, doc, model, n_questions, name):
 
 
 def open_quiz(row, name):
-    """Runs when 'Open Quiz' is clicked: load a saved quiz (free, no Claude)."""
+    """Runs when 'Open' is clicked: load a saved quiz (free, no Claude)."""
     clear_quiz()
     st.session_state["quiz"] = row["questions"]
     st.session_state["quiz_id"] = row["id"]
@@ -514,7 +561,7 @@ def start_mixed(course_id):
 
 
 def flag_question(course_id, q):
-    """Runs when 'Report This Question' is clicked. Returns True if it was saved."""
+    """Runs when 'Report' is clicked. Returns True if it was saved."""
     try:
         db.flag_question(sb, course_id, q)
         st.toast("Thanks, reported. It won't come back in revision or mixed practice.")
@@ -536,7 +583,7 @@ def save_result(course_id, quiz):
 
 
 # =====================================================================
-# SIDEBAR: the navigator (courses > modules > lectures) and all editing
+# SIDEBAR: the navigator (course > modules > lectures) plus one Manage box
 # =====================================================================
 courses = db.list_courses(sb)
 course = None
@@ -546,21 +593,13 @@ doc_id = None
 
 with st.sidebar:
     st.divider()
-    st.markdown("##### 📚 Course")
     if courses:
+        st.markdown("##### 📚 Course")
         names = {c["id"]: c["name"] for c in courses}
         st.selectbox("Course", list(names), format_func=names.get, key="course_id",
                      label_visibility="collapsed")
         course = next(c for c in courses if c["id"] == st.session_state["course_id"])
-        sidebar_course_tools(course)
 
-    with st.expander("➕ New Course", expanded=not courses):
-        st.text_input("Course Name", key="new_course_name")
-        st.selectbox("Course Type", list(STYLE_LABELS), format_func=STYLE_LABELS.get, key="new_course_style")
-        st.button("Create Course", use_container_width=True, on_click=act,
-                  args=(do_create_course,), kwargs={"done": "Course created."})
-
-    if course:
         modules = db.list_modules(sb, course["id"])
         module_by_id = {m["id"]: m for m in modules}
         docs = db.list_documents(sb, course["id"])
@@ -578,16 +617,12 @@ with st.sidebar:
         if st.session_state.get(mod_key, "all") not in options:
             st.session_state[mod_key] = "all"
 
-        st.divider()
-        st.markdown("##### 🗂️ Modules")
         if modules:
+            st.markdown("##### 🗂️ Modules")
             selected = st.radio(
                 "Module", options, key=mod_key, label_visibility="collapsed",
                 format_func=lambda v: module_label(v, docs, module_by_id, unsorted_count),
             )
-        else:
-            st.caption("No modules yet. Add one to organise this course by topic.")
-        sidebar_module_tools(course, modules, module_by_id, selected)
 
         if selected == "all":
             shown = docs
@@ -596,20 +631,38 @@ with st.sidebar:
         else:
             shown = [d for d in docs if d["module_id"] == selected]
 
-        st.divider()
         st.markdown("##### 📄 Lectures")
         if shown:
-            sort_by = st.selectbox("Sort Lectures", SORTS, key=f"sort_{course['id']}",
-                                   label_visibility="collapsed")
-            ordered = sort_docs(shown, sort_by)
+            ordered = sort_docs(shown, st.session_state.get("sort_pref", SORTS[0]))
             labels = {d["id"]: doc_label(d, module_by_id, selected) for d in ordered}
             if st.session_state.get(doc_key) not in labels:
                 st.session_state.pop(doc_key, None)  # the chosen lecture is not in this module
             doc_id = st.radio("Lecture", list(labels), format_func=labels.get, key=doc_key,
                               label_visibility="collapsed")
-            sidebar_lecture_tools(course, next(d for d in docs if d["id"] == doc_id), modules, module_by_id)
         else:
             st.caption("No lectures here yet. Add one from the main page.")
+
+        st.divider()
+
+    with st.expander("⚙️ Manage", expanded=not courses):
+        if not courses:
+            st.caption("Create your first course to get started.")
+            manage_new_course()
+        else:
+            areas = ["course", "modules", "lecture", "new"]
+            area_labels = {"course": "✏️ This Course", "modules": "🗂️ Modules",
+                           "lecture": "📄 Lectures", "new": "➕ New Course"}
+            area = st.selectbox("What would you like to change?", areas, format_func=area_labels.get,
+                                key="manage_area")
+            st.divider()
+            if area == "course":
+                manage_course(course)
+            elif area == "modules":
+                manage_modules(course, modules, selected, module_by_id)
+            elif area == "lecture":
+                manage_lecture(course, next((d for d in docs if d["id"] == doc_id), None), modules, module_by_id)
+            else:
+                manage_new_course()
 
 # =====================================================================
 # MAIN PAGE: upload, notes, quizzes
@@ -635,21 +688,14 @@ if st.session_state.get("active_doc") != doc_id:
     st.session_state.pop("guide_info", None)
     st.session_state["active_doc"] = doc_id
 
-st.title(f"📚 {course['name']}")
-st.markdown(f":{STYLE_BADGES[course['style']]}-badge[{STYLE_LABELS[course['style']]} Course]")
-
-crumb = [course["name"]]
+crumbs = []
 if selected in module_by_id:
-    crumb.append(f"{colour_info(module_by_id[selected]['colour'])[0]} {module_by_id[selected]['name']}")
+    crumbs.append(f"{colour_info(module_by_id[selected]['colour'])[0]} {module_by_id[selected]['name']}")
 elif selected == "none":
-    crumb.append("📂 Unsorted")
+    crumbs.append("📂 Unsorted")
 if doc:
-    crumb.append(doc["filename"])
-st.markdown(
-    f'<div style="border-left:6px solid {accent};background:{accent}22;padding:8px 14px;'
-    f'border-radius:6px;font-weight:600">{html.escape(" › ".join(crumb))}</div>',
-    unsafe_allow_html=True,
-)
+    crumbs.append(doc["filename"])
+hero(course["name"], STYLE_LABELS[course["style"]] + " Course", crumbs or ["All lectures"], accent)
 
 # ---------- An open quiz takes over the page ----------
 if "quiz" in st.session_state:
@@ -658,14 +704,17 @@ if "quiz" in st.session_state:
         st.subheader(st.session_state["quiz_title"])
     render_quiz(quiz, on_flag=lambda q: flag_question(course["id"], q))
 
+    in_progress = st.session_state["quiz_index"] < len(quiz)
+
     # Save the result once, the first time the results screen appears
-    if st.session_state["quiz_index"] >= len(quiz) and not st.session_state.get("attempt_saved"):
+    if not in_progress and not st.session_state.get("attempt_saved"):
         if run_safely(save_result, course["id"], quiz):
             st.session_state["attempt_saved"] = True
 
     if st.session_state.get("quiz_info"):
         st.caption(st.session_state["quiz_info"])
-    st.button("Close This Quiz", on_click=clear_quiz)
+    if in_progress:
+        st.button("✕ Exit Quiz", on_click=clear_quiz)
     st.stop()
 
 # ---------- Add a lecture ----------
@@ -728,21 +777,20 @@ with tab_notes:
 
 # ---------- Quiz ----------
 with tab_quiz:
-    with st.container(border=True):
-        st.subheader("New Quiz")
-        # A form: nothing happens until "Make Quiz" is clicked
-        with st.form("new_quiz_form"):
-            name_box = f"quiz_name_{doc_id}_{st.session_state.get('quiz_name_n', 0)}"
-            new_quiz_name = st.text_input(
-                "Quiz Name", key=name_box, max_chars=MAX_NAME_LENGTH,
-                placeholder="For example: Chapter 3 Practice (blank uses the PDF's name)",
-            )
-            n_questions = st.slider("Number of Questions", 4, 12, 8)
-            model_label = st.selectbox(
-                "Claude Model", list(MODEL_CHOICES),
-                help="The stronger model costs about 20 times more. Best for hard material such as calculations.",
-            )
-            make_clicked = st.form_submit_button("❓ Make Quiz", type="primary")
+    st.subheader("New Quiz")
+    with st.form("new_quiz_form"):
+        name_box = f"quiz_name_{doc_id}_{st.session_state.get('quiz_name_n', 0)}"
+        new_quiz_name = st.text_input(
+            "Quiz Name", key=name_box, max_chars=MAX_NAME_LENGTH,
+            placeholder="For example: Chapter 3 Practice (blank uses the PDF's name)",
+        )
+        q1, q2 = st.columns(2)
+        n_questions = q1.slider("Number of Questions", 4, 12, 8)
+        model_label = q2.selectbox(
+            "Claude Model", list(MODEL_CHOICES),
+            help="The stronger model costs about 20 times more. Best for hard material such as calculations.",
+        )
+        make_clicked = st.form_submit_button("❓ Make Quiz", type="primary", use_container_width=True)
 
     if make_clicked:
         if run_safely(make_quiz, course, doc, MODEL_CHOICES[model_label], n_questions, new_quiz_name):
@@ -753,10 +801,11 @@ with tab_quiz:
         st.divider()
         st.subheader("Saved Quizzes")
         quiz_labels = quiz_labels_for(doc["filename"], saved)
-        chosen = st.selectbox("Choose a Quiz", list(quiz_labels), format_func=quiz_labels.get,
-                              key=f"saved_quiz_{doc_id}")
-        st.button("Open Quiz", on_click=open_quiz,
-                  args=(by_id[chosen], quiz_name(by_id[chosen], doc["filename"])))
+        s1, s2 = st.columns([4, 1], vertical_alignment="bottom")
+        chosen = s1.selectbox("Choose a Quiz", list(quiz_labels), format_func=quiz_labels.get,
+                              key=f"saved_quiz_{doc_id}", label_visibility="collapsed")
+        s2.button("Open", key=f"open_quiz_{doc_id}", on_click=open_quiz, type="primary",
+                  args=(by_id[chosen], quiz_name(by_id[chosen], doc["filename"])), use_container_width=True)
 
     # The dashboard: this lecture's attempts (newest first) and its open mistakes
     st.divider()
@@ -767,33 +816,37 @@ with tab_quiz:
 
 # ---------- Revise & Practise (whole course) ----------
 with tab_revise:
-    st.subheader("🔁 Spaced Revision")
-    st.caption("This covers every lecture in the course.")
-    count_due, count_later = st.columns(2)
-    count_due.metric("Due Today", len(due))
-    count_later.metric("Scheduled Later", len(missed) - len(due))
+    left, right = st.columns(2)
+    with left:
+        with st.container(border=True):
+            st.markdown("#### 🔁 Spaced Revision")
+            m1, m2 = st.columns(2)
+            m1.metric("Due Today", len(due))
+            m2.metric("Later", len(missed) - len(due))
+            if not missed:
+                st.caption("Nothing yet. Questions you miss in quizzes collect here.")
+            elif due:
+                topics = [t for t, _ in Counter(m["topic"] for m in due).most_common(3)]
+                st.caption("Topics: " + ", ".join(safe(t) for t in topics))
+                st.button("Start Revision", key="start_rev", on_click=start_revision, args=(due,),
+                          type="primary", use_container_width=True)
+            else:
+                st.caption(f"Nothing due today. Next review: {db.short_date(min(m['due_on'] for m in missed))}.")
+                st.button("Practise Early", key="practise_early", on_click=start_revision, args=(missed,),
+                          use_container_width=True)
+    with right:
+        with st.container(border=True):
+            st.markdown("#### 🔀 Mixed Practice")
+            st.caption(f"A random mix of up to {REVISION_SIZE} questions from every saved quiz in this course.")
+            if st.button("Start Mixed Practice", key="start_mixed", use_container_width=True):
+                if run_safely(start_mixed, course["id"]):
+                    st.rerun()
 
-    if not missed:
-        st.success("Nothing to revise yet. Questions you get wrong in quizzes collect here.")
-    elif due:
-        for topic, number in Counter(m["topic"] for m in due).most_common():
-            st.write(f"- {safe(topic)} ({number})")
-        st.button("🔁 Start Revision Round", on_click=start_revision, args=(due,), type="primary")
-    else:
-        st.success(f"Nothing due today. Your next review is on "
-                   f"{db.short_date(min(m['due_on'] for m in missed))}.")
-        st.button("Practise Early", on_click=start_revision, args=(missed,))
-        st.caption("Early practice doesn't count towards mastering a question, but mistakes are still recorded.")
-    st.caption(
-        f"A revision round replays up to {REVISION_SIZE} questions. A missed question is due straight away. "
-        "Answer it correctly when it's due and it returns after 1 day, then 3 days, then counts as "
-        "mastered. A wrong answer starts it over. Free (no Claude call)."
-    )
-
-    st.divider()
-    st.subheader("🔀 Mixed Practice")
-    st.caption(f"A random mix of up to {REVISION_SIZE} questions from all your saved quizzes in this course. "
-               "Free (no Claude call).")
-    if st.button("🔀 Start Mixed Practice"):
-        if run_safely(start_mixed, course["id"]):
-            st.rerun()
+    with st.expander("ℹ️ How This Works"):
+        st.markdown(
+            f"- Revision covers every lecture in the course and replays up to {REVISION_SIZE} questions.\n"
+            "- A missed question is due straight away. Answer it correctly when it is due and it returns "
+            "after 1 day, then 3 days, then counts as mastered. A wrong answer starts it over.\n"
+            "- Practising early does not count towards mastering a question, but mistakes are still recorded.\n"
+            "- Revision and mixed practice are free (no Claude call)."
+        )
